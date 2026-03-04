@@ -44,6 +44,7 @@ var (
 	haloMode     bool
 	customPath   string
 	minAmplitude float64
+	cooldownMs   int
 )
 
 // sensorReady is closed once shared memory is created and the sensor
@@ -65,8 +66,8 @@ const (
 	// halves. Controls how fast escalation fades.
 	decayHalfLife = 30.0
 
-	// slapCooldown prevents rapid-fire audio playback.
-	slapCooldown = 750 * time.Millisecond
+	// defaultCooldownMs is the default cooldown between audio responses.
+	defaultCooldownMs = 750
 
 	// sensorPollInterval is how often we check for new accelerometer data.
 	sensorPollInterval = 10 * time.Millisecond
@@ -129,12 +130,12 @@ type slapTracker struct {
 	pack     *soundPack
 }
 
-func newSlapTracker(pack *soundPack) *slapTracker {
+func newSlapTracker(pack *soundPack, cooldown time.Duration) *slapTracker {
 	// scale maps the exponential curve so that sustained max-rate
 	// slapping (one per cooldown) reaches the final file. At steady
 	// state the score converges to ssMax; we set scale so that score
 	// maps to the last index.
-	cooldownSec := slapCooldown.Seconds()
+	cooldownSec := cooldown.Seconds()
 	ssMax := 1.0 / (1.0 - math.Pow(0.5, cooldownSec/decayHalfLife))
 	scale := (ssMax - 1) / math.Log(float64(len(pack.files)+1))
 	return &slapTracker{
@@ -198,6 +199,7 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 	cmd.Flags().BoolVarP(&haloMode, "halo", "H", false, "Enable halo mode")
 	cmd.Flags().StringVarP(&customPath, "custom", "c", "", "Path to custom MP3 audio directory")
 	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", 0.3, "Minimum amplitude threshold (0.0-1.0, lower = more sensitive)")
+	cmd.Flags().IntVar(&cooldownMs, "cooldown", defaultCooldownMs, "Cooldown between responses in milliseconds")
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
@@ -279,11 +281,12 @@ func run(ctx context.Context) error {
 	// Give the sensor a moment to start producing data.
 	time.Sleep(sensorStartupDelay)
 
-	return listenForSlaps(ctx, pack, accelRing)
+	cooldown := time.Duration(cooldownMs) * time.Millisecond
+	return listenForSlaps(ctx, pack, accelRing, cooldown)
 }
 
-func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuffer) error {
-	tracker := newSlapTracker(pack)
+func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuffer, cooldown time.Duration) error {
+	tracker := newSlapTracker(pack, cooldown)
 	speakerInit := false
 	det := detector.New()
 	var lastAccelTotal uint64
@@ -330,7 +333,7 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 		}
 		lastEventTime = ev.Time
 
-		if time.Since(lastYell) <= slapCooldown {
+		if time.Since(lastYell) <= cooldown {
 			continue
 		}
 		if ev.Amplitude < minAmplitude {
