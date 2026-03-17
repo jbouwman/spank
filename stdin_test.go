@@ -14,9 +14,10 @@ func resetGlobals() {
 	paused = false
 	pausedMu.Unlock()
 	minAmplitude = 0.05
-	cooldownMs = 750
+	cooldownMs = 200
 	stdioMode = true
 	volumeScaling = false
+	speedRatio = 1.0
 }
 
 func TestPauseCommand(t *testing.T) {
@@ -420,6 +421,51 @@ func TestAmplitudeToVolume(t *testing.T) {
 		v := amplitudeToVolume(amp)
 		if math.IsNaN(v) || math.IsInf(v, 0) {
 			t.Errorf("amplitudeToVolume(%f) returned %f", amp, v)
+		}
+	}
+}
+
+func TestAmplitudeToBoost(t *testing.T) {
+	tests := []struct {
+		name      string
+		amplitude float64
+		wantMin   float64
+		wantMax   float64
+	}{
+		{"below minimum returns min boost", 0.01, 0.5, 0.5},
+		{"at minimum returns min boost", 0.05, 0.5, 0.5},
+		{"above maximum returns max boost", 1.0, 1.5, 1.5},
+		{"at maximum returns max boost", 0.80, 1.5, 1.5},
+		{"mid amplitude returns mid-range", 0.40, 0.8, 1.3},
+		{"low amplitude is smaller than high", 0.10, 0.5, 1.0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := amplitudeToBoost(tt.amplitude)
+			if got < tt.wantMin || got > tt.wantMax {
+				t.Errorf("amplitudeToBoost(%f) = %f, want in [%f, %f]",
+					tt.amplitude, got, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+
+	// Monotonicity
+	prev := amplitudeToBoost(0.05)
+	for amp := 0.10; amp <= 0.80; amp += 0.05 {
+		cur := amplitudeToBoost(amp)
+		if cur < prev-1e-9 {
+			t.Errorf("non-monotonic: amplitudeToBoost(%f)=%f < prev=%f",
+				amp, cur, prev)
+		}
+		prev = cur
+	}
+
+	// No NaN or Inf
+	for _, amp := range []float64{0, 0.05, 0.1, 0.5, 0.8, 1.0, 10.0} {
+		v := amplitudeToBoost(amp)
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			t.Errorf("amplitudeToBoost(%f) returned %f", amp, v)
 		}
 	}
 }

@@ -1,13 +1,14 @@
-// spank detects slaps/hits on the laptop and plays audio responses.
+// spank detects slaps/hits on the laptop and runs an ASCII footrace.
 // It reads the Apple Silicon accelerometer directly via IOKit HID —
 // no separate sensor daemon required. Needs sudo.
+//
+// Slap or tap your laptop to sprint! Each hit accelerates your runner.
+// Inspired by Microsoft Decathlon's alternating-key sprinting mechanic.
 package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,17 +16,12 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/charmbracelet/fang"
-	"github.com/gopxl/beep/v2"
-	"github.com/gopxl/beep/v2/effects"
-	"github.com/gopxl/beep/v2/mp3"
-	"github.com/gopxl/beep/v2/speaker"
 	"github.com/spf13/cobra"
 	"github.com/taigrr/apple-silicon-accelerometer/detector"
 	"github.com/taigrr/apple-silicon-accelerometer/sensor"
@@ -34,28 +30,17 @@ import (
 
 var version = "dev"
 
-//go:embed audio/pain/*.mp3
-var painAudio embed.FS
-
-//go:embed audio/sexy/*.mp3
-var sexyAudio embed.FS
-
-//go:embed audio/halo/*.mp3
-var haloAudio embed.FS
-
 var (
-	sexyMode     bool
-	haloMode     bool
-	customPath   string
-	customFiles  []string
-	fastMode     bool
-	minAmplitude float64
-	cooldownMs   int
-	stdioMode      bool
-	volumeScaling  bool
-	paused         bool
-	pausedMu       sync.RWMutex
-	speedRatio     float64
+	fastMode      bool
+	minAmplitude  float64
+	cooldownMs    int
+	stdioMode     bool
+	volumeScaling bool
+	paused        bool
+	pausedMu      sync.RWMutex
+	speedRatio    float64
+	raceDistance   float64
+	numOpponents  int
 )
 
 // sensorReady is closed once shared memory is created and the sensor
@@ -65,36 +50,22 @@ var sensorReady = make(chan struct{})
 // sensorErr receives any error from the sensor worker.
 var sensorErr = make(chan error, 1)
 
-type playMode int
-
 const (
-	modeRandom playMode = iota
-	modeEscalation
-)
-
-const (
-	// decayHalfLife is how many seconds of inactivity before intensity
-	// halves. Controls how fast escalation fades.
-	decayHalfLife = 30.0
-
-	// defaultMinAmplitude is the default detection threshold.
-	defaultMinAmplitude = 0.05
-
-	// defaultCooldownMs is the default cooldown between audio responses.
-	defaultCooldownMs = 750
-
-	// defaultSpeedRatio is the default playback speed (1.0 = normal).
-	defaultSpeedRatio = 1.0
-
-	// defaultSensorPollInterval is how often we check for new accelerometer data.
+	defaultMinAmplitude       = 0.05
+	defaultCooldownMs         = 200 // shorter cooldown for responsive sprinting
+	defaultSpeedRatio         = 1.0
 	defaultSensorPollInterval = 10 * time.Millisecond
+	defaultMaxSampleBatch     = 200
+	sensorStartupDelay        = 100 * time.Millisecond
+	defaultRaceDistance       = 100.0
+	defaultNumOpponents       = 3
 
-	// defaultMaxSampleBatch caps the number of accelerometer samples processed
-	// per tick to avoid falling behind.
-	defaultMaxSampleBatch = 200
-
-	// sensorStartupDelay gives the sensor time to start producing data.
-	sensorStartupDelay = 100 * time.Millisecond
+	// Physics constants
+	tapImpulse     = 2.0   // m/s added per tap
+	maxPlayerSpeed = 12.0  // m/s cap (Usain Bolt peaks ~12.2 m/s)
+	friction       = 0.975 // velocity multiplier per frame at 30fps
+	renderFPS      = 30
+	trackWidth     = 60 // display characters for the track
 )
 
 type runtimeTuning struct {
@@ -115,7 +86,7 @@ func defaultTuning() runtimeTuning {
 
 func applyFastOverlay(base runtimeTuning) runtimeTuning {
 	base.pollInterval = 4 * time.Millisecond
-	base.cooldown = 350 * time.Millisecond
+	base.cooldown = 150 * time.Millisecond
 	if base.minAmplitude > 0.18 {
 		base.minAmplitude = 0.18
 	}
@@ -125,118 +96,280 @@ func applyFastOverlay(base runtimeTuning) runtimeTuning {
 	return base
 }
 
-type soundPack struct {
-	name   string
-	fs     embed.FS
-	dir    string
-	mode   playMode
-	files  []string
-	custom bool
+// --------------------------------------------------------------------
+// Runner & Race types
+// --------------------------------------------------------------------
+
+type runner struct {
+	name        string
+	lane        int
+	position    float64 // meters
+	velocity    float64 // m/s
+	animFrame   int
+	animCounter int
+	isPlayer    bool
+	finished    bool
+	finishTime  time.Duration
+	// AI fields
+	targetSpeed float64
+	accelRate   float64
+	jitter      float64
 }
 
-func (sp *soundPack) loadFiles() error {
-	if sp.custom {
-		entries, err := os.ReadDir(sp.dir)
-		if err != nil {
-			return err
+// Running animation frames (side-view stick figure)
+var runFrames = []string{
+	`o/`,
+	`o-`,
+	`o\`,
+	`o-`,
+}
+
+const idleFrame = `o|`
+const winFrame = `\o/`
+
+type aiProfile struct {
+	name        string
+	targetSpeed float64
+	accelRate   float64
+	jitter      float64
+}
+
+var defaultAIProfiles = []aiProfile{
+	{"BOLT", 10.0, 0.7, 0.3},
+	{"CARL", 9.2, 0.55, 0.4},
+	{"FAYE", 8.6, 0.65, 0.25},
+	{"DREW", 8.0, 0.45, 0.5},
+}
+
+// amplitudeToBoost maps a detected slap amplitude to a speed boost
+// multiplier. Harder hits give a bigger boost.
+// Returns a value in [0.5, 1.5].
+func amplitudeToBoost(amplitude float64) float64 {
+	const (
+		minAmp   = 0.05
+		maxAmp   = 0.80
+		minBoost = 0.5
+		maxBoost = 1.5
+	)
+	if amplitude <= minAmp {
+		return minBoost
+	}
+	if amplitude >= maxAmp {
+		return maxBoost
+	}
+	t := (amplitude - minAmp) / (maxAmp - minAmp)
+	t = math.Log(1+t*99) / math.Log(100)
+	return minBoost + t*(maxBoost-minBoost)
+}
+
+// amplitudeToVolume is kept for backward compatibility with stdio commands.
+// Maps amplitude to a volume level in [-3.0, 0.0].
+func amplitudeToVolume(amplitude float64) float64 {
+	const (
+		minAmp = 0.05
+		maxAmp = 0.80
+		minVol = -3.0
+		maxVol = 0.0
+	)
+	if amplitude <= minAmp {
+		return minVol
+	}
+	if amplitude >= maxAmp {
+		return maxVol
+	}
+	t := (amplitude - minAmp) / (maxAmp - minAmp)
+	t = math.Log(1+t*99) / math.Log(100)
+	return minVol + t*(maxVol-minVol)
+}
+
+// --------------------------------------------------------------------
+// Rendering
+// --------------------------------------------------------------------
+
+func clearScreen() {
+	fmt.Print("\033[2J\033[H")
+}
+
+func hideCursor() {
+	fmt.Print("\033[?25l")
+}
+
+func showCursor() {
+	fmt.Print("\033[?25h")
+}
+
+func renderRace(runners []*runner, elapsed time.Duration, distance float64, phase string) {
+	fmt.Print("\033[H") // cursor home (no clear to reduce flicker)
+
+	var buf strings.Builder
+
+	seconds := elapsed.Seconds()
+	timeStr := fmt.Sprintf("%02d:%05.2f", int(seconds)/60, math.Mod(seconds, 60))
+
+	// Header
+	buf.WriteString("\n")
+	buf.WriteString(fmt.Sprintf("  %-40s Time: %s\n", "SPANK SPRINT  "+fmt.Sprintf("%.0fm DASH", distance), timeStr))
+	buf.WriteString("\n")
+
+	// Track top border with distance markers
+	border := "  " + strings.Repeat("·", trackWidth+4) + "|\n"
+	buf.WriteString(border)
+
+	finishLabel := fmt.Sprintf("%*s", trackWidth+3, "FINISH")
+	buf.WriteString("  " + finishLabel + "|\n")
+
+	// Lanes
+	for _, r := range runners {
+		col := int(r.position / distance * float64(trackWidth))
+		if col > trackWidth {
+			col = trackWidth
 		}
-		sp.files = make([]string, 0, len(entries))
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				sp.files = append(sp.files, sp.dir+"/"+entry.Name())
+		if col < 0 {
+			col = 0
+		}
+
+		// Choose sprite
+		var sprite string
+		switch {
+		case r.finished:
+			sprite = winFrame
+		case r.velocity < 0.3:
+			sprite = idleFrame
+		default:
+			sprite = runFrames[r.animFrame%len(runFrames)]
+		}
+
+		label := r.name
+		if r.isPlayer {
+			label = r.name + "*"
+		}
+
+		// Build lane: "  1 NAME   [sprite at position]          |"
+		lane := make([]byte, trackWidth+2)
+		for i := range lane {
+			lane[i] = ' '
+		}
+		lane[trackWidth+1] = '|'
+
+		// Place sprite
+		spriteBytes := []byte(sprite)
+		for i, b := range spriteBytes {
+			pos := col + i
+			if pos < trackWidth+1 {
+				lane[pos] = b
 			}
 		}
-	} else {
-		entries, err := sp.fs.ReadDir(sp.dir)
-		if err != nil {
-			return err
-		}
-		sp.files = make([]string, 0, len(entries))
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				sp.files = append(sp.files, sp.dir+"/"+entry.Name())
+
+		buf.WriteString(fmt.Sprintf("  %d %-5s %s\n", r.lane, label, string(lane)))
+	}
+
+	// Track bottom border
+	buf.WriteString(border)
+	buf.WriteString("\n")
+
+	// Status line
+	switch phase {
+	case "countdown":
+		buf.WriteString("                  GET READY...\n")
+	case "racing":
+		player := runners[0]
+		speedStr := fmt.Sprintf("%.1f m/s", player.velocity)
+		distStr := fmt.Sprintf("%.1f m / %.0f m", player.position, distance)
+		buf.WriteString(fmt.Sprintf("  Speed: %-12s  Distance: %-20s  SLAP to sprint!\n", speedStr, distStr))
+	case "finished":
+		buf.WriteString("  RACE OVER!\n")
+	}
+
+	buf.WriteString("\n")
+
+	fmt.Print(buf.String())
+}
+
+func renderCountdown(runners []*runner, distance float64, count int) {
+	elapsed := time.Duration(0)
+	renderRace(runners, elapsed, distance, "countdown")
+
+	// Countdown number big and centered
+	var label string
+	switch count {
+	case 3:
+		label = "         >>> 3 <<<"
+	case 2:
+		label = "         >>> 2 <<<"
+	case 1:
+		label = "         >>> 1 <<<"
+	case 0:
+		label = "        >>> GO! <<<"
+	}
+	fmt.Printf("\n%s\n", label)
+}
+
+func renderResults(runners []*runner) {
+	fmt.Println()
+	fmt.Println("  ╔══════════════════════════════════╗")
+	fmt.Println("  ║          RACE  RESULTS           ║")
+	fmt.Println("  ╠══════════════════════════════════╣")
+
+	// Sort by finish time (unfinished last)
+	sorted := make([]*runner, len(runners))
+	copy(sorted, runners)
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			iTime := sorted[i].finishTime
+			jTime := sorted[j].finishTime
+			if !sorted[i].finished {
+				iTime = time.Hour
+			}
+			if !sorted[j].finished {
+				jTime = time.Hour
+			}
+			if jTime < iTime {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
 			}
 		}
 	}
-	sort.Strings(sp.files)
-	if len(sp.files) == 0 {
-		return fmt.Errorf("no audio files found in %s", sp.dir)
+
+	places := []string{"1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th"}
+	for i, r := range sorted {
+		place := places[i]
+		tag := "    "
+		if r.isPlayer {
+			tag = " <- YOU"
+		}
+		timeStr := "DNF"
+		if r.finished {
+			secs := r.finishTime.Seconds()
+			timeStr = fmt.Sprintf("%05.2fs", secs)
+		}
+		fmt.Printf("  ║  %s  %-6s  %s%s\n", place, r.name, timeStr, tag)
 	}
-	return nil
+	fmt.Println("  ║                                  ║")
+	fmt.Println("  ╚══════════════════════════════════╝")
+	fmt.Println()
 }
 
-type slapTracker struct {
-	mu       sync.Mutex
-	score    float64
-	lastTime time.Time
-	total    int
-	halfLife float64 // seconds
-	scale    float64 // controls the escalation curve shape
-	pack     *soundPack
-}
-
-func newSlapTracker(pack *soundPack, cooldown time.Duration) *slapTracker {
-	// scale maps the exponential curve so that sustained max-rate
-	// slapping (one per cooldown) reaches the final file. At steady
-	// state the score converges to ssMax; we set scale so that score
-	// maps to the last index.
-	cooldownSec := cooldown.Seconds()
-	ssMax := 1.0 / (1.0 - math.Pow(0.5, cooldownSec/decayHalfLife))
-	scale := (ssMax - 1) / math.Log(float64(len(pack.files)+1))
-	return &slapTracker{
-		halfLife: decayHalfLife,
-		scale:    scale,
-		pack:     pack,
-	}
-}
-
-func (st *slapTracker) record(now time.Time) (int, float64) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	if !st.lastTime.IsZero() {
-		elapsed := now.Sub(st.lastTime).Seconds()
-		st.score *= math.Pow(0.5, elapsed/st.halfLife)
-	}
-	st.score += 1.0
-	st.lastTime = now
-	st.total++
-	return st.total, st.score
-}
-
-func (st *slapTracker) getFile(score float64) string {
-	if st.pack.mode == modeRandom {
-		return st.pack.files[rand.Intn(len(st.pack.files))]
-	}
-
-	// Escalation: 1-exp(-x) curve maps score to file index.
-	// At sustained max slap rate, score reaches ssMax which maps
-	// to the final file.
-	maxIdx := len(st.pack.files) - 1
-	idx := min(int(float64(len(st.pack.files)) * (1.0 - math.Exp(-(score-1)/st.scale))), maxIdx)
-	return st.pack.files[idx]
-}
+// --------------------------------------------------------------------
+// CLI
+// --------------------------------------------------------------------
 
 func main() {
 	cmd := &cobra.Command{
 		Use:   "spank",
-		Short: "Yells 'ow!' when you slap the laptop",
+		Short: "ASCII sprint race powered by slapping your laptop",
 		Long: `spank reads the Apple Silicon accelerometer directly via IOKit HID
-and plays audio responses when a slap or hit is detected.
+and runs an ASCII-animated footrace. Slap or tap the laptop to sprint!
+
+Each detected hit accelerates your runner. Harder hits give bigger boosts.
+Race against AI opponents in a 100m dash (configurable with --distance).
 
 Requires sudo (for IOKit HID access to the accelerometer).
-
-Use --sexy for a different experience. In sexy mode, the more you slap
-within a minute, the more intense the sounds become.
-
-Use --halo to play random audio clips from Halo soundtracks on each slap.`,
+Inspired by Microsoft Decathlon's alternating-key sprinting mechanic.`,
 		Version: version,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			tuning := defaultTuning()
 			if fastMode {
 				tuning = applyFastOverlay(tuning)
 			}
-			// Explicit flags override fast preset defaults
 			if cmd.Flags().Changed("min-amplitude") {
 				tuning.minAmplitude = minAmplitude
 			}
@@ -248,16 +381,14 @@ Use --halo to play random audio clips from Halo soundtracks on each slap.`,
 		SilenceUsage: true,
 	}
 
-	cmd.Flags().BoolVarP(&sexyMode, "sexy", "s", false, "Enable sexy mode")
-	cmd.Flags().BoolVarP(&haloMode, "halo", "H", false, "Enable halo mode")
-	cmd.Flags().StringVarP(&customPath, "custom", "c", "", "Path to custom MP3 audio directory")
-	cmd.Flags().BoolVar(&fastMode, "fast", false, "Enable faster detection tuning (shorter cooldown, higher sensitivity)")
-	cmd.Flags().StringSliceVar(&customFiles, "custom-files", nil, "Comma-separated list of custom MP3 files")
-	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0, lower = more sensitive)")
-	cmd.Flags().IntVar(&cooldownMs, "cooldown", defaultCooldownMs, "Cooldown between responses in milliseconds")
-	cmd.Flags().BoolVar(&stdioMode, "stdio", false, "Enable stdio mode: JSON output and stdin commands (for GUI integration)")
-	cmd.Flags().BoolVar(&volumeScaling, "volume-scaling", false, "Scale playback volume by slap amplitude (harder hits = louder)")
-	cmd.Flags().Float64Var(&speedRatio, "speed", defaultSpeedRatio, "Playback speed multiplier (0.5 = half speed, 2.0 = double speed)")
+	cmd.Flags().BoolVar(&fastMode, "fast", false, "Faster polling, shorter cooldown, higher sensitivity")
+	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0)")
+	cmd.Flags().IntVar(&cooldownMs, "cooldown", defaultCooldownMs, "Cooldown between tap detections in ms")
+	cmd.Flags().BoolVar(&stdioMode, "stdio", false, "Enable stdio mode: JSON output and stdin commands")
+	cmd.Flags().BoolVar(&volumeScaling, "volume-scaling", false, "Scale speed boost by slap amplitude (harder hits = bigger boost)")
+	cmd.Flags().Float64Var(&speedRatio, "speed", defaultSpeedRatio, "Game speed multiplier (1.0 = normal, 2.0 = double)")
+	cmd.Flags().Float64Var(&raceDistance, "distance", defaultRaceDistance, "Race distance in meters")
+	cmd.Flags().IntVar(&numOpponents, "opponents", defaultNumOpponents, "Number of AI opponents (1-4)")
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
@@ -269,55 +400,17 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		return fmt.Errorf("spank requires root privileges for accelerometer access, run with: sudo spank")
 	}
 
-	modeCount := 0
-	if sexyMode {
-		modeCount++
-	}
-	if haloMode {
-		modeCount++
-	}
-	if customPath != "" || len(customFiles) > 0 {
-		modeCount++
-	}
-	if modeCount > 1 {
-		return fmt.Errorf("--sexy, --halo, and --custom/--custom-files are mutually exclusive; pick one")
-	}
-
 	if tuning.minAmplitude < 0 || tuning.minAmplitude > 1 {
 		return fmt.Errorf("--min-amplitude must be between 0.0 and 1.0")
 	}
 	if tuning.cooldown <= 0 {
 		return fmt.Errorf("--cooldown must be greater than 0")
 	}
-
-	var pack *soundPack
-	switch {
-	case len(customFiles) > 0:
-		// Validate all files exist and are MP3s
-		for _, f := range customFiles {
-			if !strings.HasSuffix(strings.ToLower(f), ".mp3") {
-				return fmt.Errorf("custom file must be MP3: %s", f)
-			}
-			if _, err := os.Stat(f); err != nil {
-				return fmt.Errorf("custom file not found: %s", f)
-			}
-		}
-		pack = &soundPack{name: "custom", mode: modeRandom, custom: true, files: customFiles}
-	case customPath != "":
-		pack = &soundPack{name: "custom", dir: customPath, mode: modeRandom, custom: true}
-	case sexyMode:
-		pack = &soundPack{name: "sexy", fs: sexyAudio, dir: "audio/sexy", mode: modeEscalation}
-	case haloMode:
-		pack = &soundPack{name: "halo", fs: haloAudio, dir: "audio/halo", mode: modeRandom}
-	default:
-		pack = &soundPack{name: "pain", fs: painAudio, dir: "audio/pain", mode: modeRandom}
+	if raceDistance <= 0 {
+		return fmt.Errorf("--distance must be greater than 0")
 	}
-
-	// Only load files if not already set (customFiles case)
-	if len(pack.files) == 0 {
-		if err := pack.loadFiles(); err != nil {
-			return fmt.Errorf("loading %s audio: %w", pack.name, err)
-		}
+	if numOpponents < 1 || numOpponents > 4 {
+		return fmt.Errorf("--opponents must be between 1 and 4")
 	}
 
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
@@ -331,9 +424,6 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	defer accelRing.Close()
 	defer accelRing.Unlink()
 
-	// Start the sensor worker in a background goroutine.
-	// sensor.Run() needs runtime.LockOSThread for CFRunLoop, which it
-	// handles internally. We launch detection on the current goroutine.
 	go func() {
 		close(sensorReady)
 		if err := sensor.Run(sensor.Config{
@@ -344,7 +434,6 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		}
 	}()
 
-	// Wait for sensor to be ready.
 	select {
 	case <-sensorReady:
 	case err := <-sensorErr:
@@ -353,33 +442,227 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		return nil
 	}
 
-	// Give the sensor a moment to start producing data.
 	time.Sleep(sensorStartupDelay)
 
-	return listenForSlaps(ctx, pack, accelRing, tuning)
+	return runRace(ctx, accelRing, tuning)
 }
 
-func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuffer, tuning runtimeTuning) error {
-	tracker := newSlapTracker(pack, tuning.cooldown)
-	speakerInit := false
-	det := detector.New()
-	var lastAccelTotal uint64
-	var lastEventTime time.Time
-	var lastYell time.Time
+// --------------------------------------------------------------------
+// Race game loop
+// --------------------------------------------------------------------
+
+// tapEvent signals that a slap was detected with given amplitude.
+type tapEvent struct {
+	amplitude float64
+}
+
+func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTuning) error {
+	// Build runners
+	runners := make([]*runner, 0, numOpponents+1)
+	runners = append(runners, &runner{
+		name:     "YOU",
+		lane:     1,
+		isPlayer: true,
+	})
+	for i := 0; i < numOpponents && i < len(defaultAIProfiles); i++ {
+		ai := defaultAIProfiles[i]
+		runners = append(runners, &runner{
+			name:        ai.name,
+			lane:        i + 2,
+			targetSpeed: ai.targetSpeed * speedRatio,
+			accelRate:   ai.accelRate,
+			jitter:      ai.jitter,
+		})
+	}
 
 	// Start stdin command reader if in JSON mode
 	if stdioMode {
 		go readStdinCommands()
 	}
 
-	presetLabel := "default"
-	if fastMode {
-		presetLabel = "fast"
+	hideCursor()
+	defer showCursor()
+	clearScreen()
+
+	// Countdown
+	for count := 3; count >= 0; count-- {
+		select {
+		case <-ctx.Done():
+			showCursor()
+			fmt.Println("\nbye!")
+			return nil
+		default:
+		}
+		renderCountdown(runners, raceDistance, count)
+		if count > 0 {
+			time.Sleep(1 * time.Second)
+		} else {
+			time.Sleep(400 * time.Millisecond)
+		}
 	}
-	fmt.Printf("spank: listening for slaps in %s mode with %s tuning... (ctrl+c to quit)\n", pack.name, presetLabel)
-	if stdioMode {
-		fmt.Println(`{"status":"ready"}`)
+
+	// Start tap detection in a goroutine that sends events
+	tapCh := make(chan tapEvent, 32)
+	go detectTaps(ctx, accelRing, tuning, tapCh)
+
+	startTime := time.Now()
+	frameTicker := time.NewTicker(time.Second / renderFPS)
+	defer frameTicker.Stop()
+
+	raceFinished := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			showCursor()
+			clearScreen()
+			fmt.Println("\nRace cancelled. bye!")
+			return nil
+		case <-frameTicker.C:
+		}
+
+		// Check if paused
+		pausedMu.RLock()
+		isPaused := paused
+		pausedMu.RUnlock()
+		if isPaused {
+			renderRace(runners, time.Since(startTime), raceDistance, "racing")
+			continue
+		}
+
+		// Drain tap events and apply boosts to player
+		player := runners[0]
+	drainTaps:
+		for {
+			select {
+			case ev := <-tapCh:
+				if !player.finished {
+					boost := tapImpulse * speedRatio
+					if volumeScaling {
+						boost *= amplitudeToBoost(ev.amplitude)
+					}
+					player.velocity += boost
+					if player.velocity > maxPlayerSpeed*speedRatio {
+						player.velocity = maxPlayerSpeed * speedRatio
+					}
+				}
+			default:
+				break drainTaps
+			}
+		}
+
+		elapsed := time.Since(startTime)
+		dt := 1.0 / float64(renderFPS)
+
+		// Update all runners
+		allFinished := true
+		for _, r := range runners {
+			if r.finished {
+				continue
+			}
+			allFinished = false
+
+			if !r.isPlayer {
+				// AI: gradually accelerate toward target speed with jitter
+				diff := r.targetSpeed - r.velocity
+				r.velocity += diff * r.accelRate * dt
+				r.velocity += (rand.Float64()*2 - 1) * r.jitter * dt
+				if r.velocity < 0 {
+					r.velocity = 0
+				}
+				if r.velocity > r.targetSpeed*1.05 {
+					r.velocity = r.targetSpeed * 1.05
+				}
+			} else {
+				// Player: apply friction decay
+				r.velocity *= math.Pow(friction, float64(renderFPS)*dt)
+				if r.velocity < 0.01 {
+					r.velocity = 0
+				}
+			}
+
+			r.position += r.velocity * dt
+
+			// Check finish
+			if r.position >= raceDistance {
+				r.position = raceDistance
+				r.finished = true
+				r.finishTime = elapsed
+				if r.isPlayer && stdioMode {
+					event := map[string]interface{}{
+						"event":      "finish",
+						"runner":     r.name,
+						"time":       elapsed.Seconds(),
+						"is_player":  true,
+					}
+					if data, err := json.Marshal(event); err == nil {
+						fmt.Println(string(data))
+					}
+				}
+			}
+
+			// Animate running sprite
+			if r.velocity > 0.3 {
+				r.animCounter++
+				framesPerStep := max(1, int(8.0/(r.velocity+0.1)))
+				if r.animCounter >= framesPerStep {
+					r.animFrame = (r.animFrame + 1) % len(runFrames)
+					r.animCounter = 0
+				}
+			}
+		}
+
+		phase := "racing"
+		if allFinished || raceFinished {
+			phase = "finished"
+		}
+
+		renderRace(runners, elapsed, raceDistance, phase)
+
+		if allFinished && !raceFinished {
+			raceFinished = true
+			renderResults(runners)
+			fmt.Println("  Press Ctrl+C to exit.")
+
+			if stdioMode {
+				results := make([]map[string]interface{}, len(runners))
+				for i, r := range runners {
+					results[i] = map[string]interface{}{
+						"runner":    r.name,
+						"time":      r.finishTime.Seconds(),
+						"is_player": r.isPlayer,
+					}
+				}
+				if data, err := json.Marshal(map[string]interface{}{
+					"event":   "race_complete",
+					"results": results,
+				}); err == nil {
+					fmt.Println(string(data))
+				}
+			}
+		}
+
+		// After race finished, just keep displaying until Ctrl+C
+		if raceFinished {
+			// Idle loop waiting for exit
+			select {
+			case <-ctx.Done():
+				showCursor()
+				fmt.Println("\nbye!")
+				return nil
+			case <-frameTicker.C:
+				continue
+			}
+		}
 	}
+}
+
+// detectTaps polls the accelerometer and sends tap events on the channel.
+func detectTaps(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTuning, tapCh chan<- tapEvent) {
+	det := detector.New()
+	var lastAccelTotal uint64
+	var lastEventTime time.Time
+	var lastTap time.Time
 
 	ticker := time.NewTicker(tuning.pollInterval)
 	defer ticker.Stop()
@@ -387,14 +670,10 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("\nbye!")
-			return nil
-		case err := <-sensorErr:
-			return fmt.Errorf("sensor worker failed: %w", err)
+			return
 		case <-ticker.C:
 		}
 
-		// Check if paused
 		pausedMu.RLock()
 		isPaused := paused
 		pausedMu.RUnlock()
@@ -427,133 +706,26 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 		}
 		lastEventTime = ev.Time
 
-		if time.Since(lastYell) <= time.Duration(cooldownMs)*time.Millisecond {
+		if time.Since(lastTap) <= tuning.cooldown {
 			continue
 		}
-		if ev.Amplitude < minAmplitude {
+		if ev.Amplitude < tuning.minAmplitude {
 			continue
 		}
 
-		lastYell = now
-		num, score := tracker.record(now)
-		file := tracker.getFile(score)
-		if stdioMode {
-			event := map[string]interface{}{
-				"timestamp":  now.Format(time.RFC3339Nano),
-				"slapNumber": num,
-				"amplitude":  ev.Amplitude,
-				"severity":   string(ev.Severity),
-				"file":       file,
-			}
-			if data, err := json.Marshal(event); err == nil {
-				fmt.Println(string(data))
-			}
-		} else {
-			fmt.Printf("slap #%d [%s amp=%.5fg] -> %s\n", num, ev.Severity, ev.Amplitude, file)
+		lastTap = now
+
+		select {
+		case tapCh <- tapEvent{amplitude: ev.Amplitude}:
+		default:
 		}
-		go playAudio(pack, file, ev.Amplitude, &speakerInit)
 	}
 }
 
-var speakerMu sync.Mutex
+// --------------------------------------------------------------------
+// Stdin command interface (kept for stdio/GUI integration)
+// --------------------------------------------------------------------
 
-// amplitudeToVolume maps a detected amplitude to a beep/effects.Volume
-// level. Amplitude typically ranges from ~0.05 (light tap) to ~1.0+
-// (hard slap). The mapping uses a logarithmic curve so that light taps
-// are noticeably quieter and hard hits play near full volume.
-//
-// Returns a value in the range [-3.0, 0.0] for use with effects.Volume
-// (base 2): -3.0 is ~1/8 volume, 0.0 is full volume.
-func amplitudeToVolume(amplitude float64) float64 {
-	const (
-		minAmp   = 0.05  // softest detectable
-		maxAmp   = 0.80  // treat anything above this as max
-		minVol   = -3.0  // quietest playback (1/8 volume with base 2)
-		maxVol   = 0.0   // full volume
-	)
-
-	// Clamp
-	if amplitude <= minAmp {
-		return minVol
-	}
-	if amplitude >= maxAmp {
-		return maxVol
-	}
-
-	// Normalize to [0, 1]
-	t := (amplitude - minAmp) / (maxAmp - minAmp)
-
-	// Log curve for more natural volume scaling
-	// log(1 + t*99) / log(100) maps [0,1] -> [0,1] with a log curve
-	t = math.Log(1+t*99) / math.Log(100)
-
-	return minVol + t*(maxVol-minVol)
-}
-
-func playAudio(pack *soundPack, path string, amplitude float64, speakerInit *bool) {
-	var streamer beep.StreamSeekCloser
-	var format beep.Format
-
-	if pack.custom {
-		file, err := os.Open(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "spank: open %s: %v\n", path, err)
-			return
-		}
-		defer file.Close()
-		streamer, format, err = mp3.Decode(file)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "spank: decode %s: %v\n", path, err)
-			return
-		}
-	} else {
-		data, err := pack.fs.ReadFile(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "spank: read %s: %v\n", path, err)
-			return
-		}
-		streamer, format, err = mp3.Decode(io.NopCloser(bytes.NewReader(data)))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "spank: decode %s: %v\n", path, err)
-			return
-		}
-	}
-	defer streamer.Close()
-
-	speakerMu.Lock()
-	if !*speakerInit {
-		speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
-		*speakerInit = true
-	}
-	speakerMu.Unlock()
-
-	// Optionally scale volume based on slap amplitude
-	var source beep.Streamer = streamer
-	if volumeScaling {
-		source = &effects.Volume{
-			Streamer: streamer,
-			Base:     2,
-			Volume:   amplitudeToVolume(amplitude),
-			Silent:   false,
-		}
-	}
-
-	// Apply speed change via resampling trick:
-	// Claiming the audio is at rate*speed and resampling back to rate
-	// makes the speaker consume samples faster/slower.
-	if speedRatio != 1.0 && speedRatio > 0 {
-		fakeRate := beep.SampleRate(int(float64(format.SampleRate) * speedRatio))
-		source = beep.Resample(4, fakeRate, format.SampleRate, source)
-	}
-
-	done := make(chan bool)
-	speaker.Play(beep.Seq(source, beep.Callback(func() {
-		done <- true
-	})))
-	<-done
-}
-
-// stdinCommand represents a command received via stdin
 type stdinCommand struct {
 	Cmd       string  `json:"cmd"`
 	Amplitude float64 `json:"amplitude,omitempty"`
@@ -561,13 +733,10 @@ type stdinCommand struct {
 	Speed     float64 `json:"speed,omitempty"`
 }
 
-// readStdinCommands reads JSON commands from stdin for live control
 func readStdinCommands() {
 	processCommands(os.Stdin, os.Stdout)
 }
 
-// processCommands reads JSON commands from r and writes responses to w.
-// This is the testable core of the stdin command handler.
 func processCommands(r io.Reader, w io.Writer) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
