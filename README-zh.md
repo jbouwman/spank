@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="doc/logo.png" alt="spank logo" width="200">
+</p>
+
 # spank
 
 [English][readme-en-link] | **简体中文**
