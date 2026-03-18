@@ -470,6 +470,154 @@ func TestAmplitudeToBoost(t *testing.T) {
 	}
 }
 
+func TestNoteFreq(t *testing.T) {
+	// A4 (MIDI 69) should be exactly 440 Hz
+	a4 := noteFreq(69)
+	if math.Abs(a4-440.0) > 0.001 {
+		t.Errorf("noteFreq(69) = %f, want 440.0", a4)
+	}
+
+	// C4 (MIDI 60) should be ~261.63 Hz
+	c4 := noteFreq(60)
+	if math.Abs(c4-261.626) > 0.01 {
+		t.Errorf("noteFreq(60) = %f, want ~261.63", c4)
+	}
+
+	// Octave relationship: MIDI note + 12 = double frequency
+	for midi := 36; midi < 84; midi++ {
+		f1 := noteFreq(midi)
+		f2 := noteFreq(midi + 12)
+		ratio := f2 / f1
+		if math.Abs(ratio-2.0) > 0.001 {
+			t.Errorf("noteFreq(%d)/noteFreq(%d) = %f, want 2.0", midi+12, midi, ratio)
+		}
+	}
+
+	// Monotonicity: higher MIDI = higher frequency
+	for midi := 21; midi < 108; midi++ {
+		if noteFreq(midi+1) <= noteFreq(midi) {
+			t.Errorf("noteFreq(%d) >= noteFreq(%d)", midi, midi+1)
+		}
+	}
+}
+
+func TestNoteName(t *testing.T) {
+	tests := []struct {
+		midi int
+		want string
+	}{
+		{60, "C4"},
+		{61, "C#4"},
+		{69, "A4"},
+		{72, "C5"},
+		{48, "C3"},
+		{71, "B4"},
+	}
+	for _, tt := range tests {
+		got := noteName(tt.midi)
+		if got != tt.want {
+			t.Errorf("noteName(%d) = %q, want %q", tt.midi, got, tt.want)
+		}
+	}
+}
+
+func TestKeyToMIDIMapping(t *testing.T) {
+	// Verify all mapped keys produce valid MIDI values
+	for key, midi := range keyToMIDI {
+		if midi < 21 || midi > 108 {
+			t.Errorf("keyToMIDI[%c] = %d, outside reasonable MIDI range", key, midi)
+		}
+	}
+
+	// Verify piano layout: white key sequence should be ascending
+	whiteKeysUpper := []byte{'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'}
+	for i := 1; i < len(whiteKeysUpper); i++ {
+		prev := keyToMIDI[whiteKeysUpper[i-1]]
+		cur := keyToMIDI[whiteKeysUpper[i]]
+		if cur <= prev {
+			t.Errorf("white key %c (MIDI %d) should be higher than %c (MIDI %d)",
+				whiteKeysUpper[i], cur, whiteKeysUpper[i-1], prev)
+		}
+	}
+
+	// Verify black keys are between adjacent white keys
+	// '2' should be between 'q' (C4=60) and 'w' (D4=62) -> C#4=61
+	if keyToMIDI['2'] != 61 {
+		t.Errorf("keyToMIDI['2'] = %d, want 61 (C#4)", keyToMIDI['2'])
+	}
+}
+
+func TestAccordionStateActiveNotes(t *testing.T) {
+	state := newAccordionState()
+
+	// No notes initially
+	notes := state.activeNotes()
+	if len(notes) != 0 {
+		t.Errorf("expected 0 active notes, got %d", len(notes))
+	}
+
+	// Press a key
+	state.pressKey('q') // C4
+	notes = state.activeNotes()
+	if len(notes) != 1 || notes[0] != 60 {
+		t.Errorf("expected [60], got %v", notes)
+	}
+
+	// Press another key
+	state.pressKey('e') // E4
+	notes = state.activeNotes()
+	if len(notes) != 2 {
+		t.Errorf("expected 2 active notes, got %d", len(notes))
+	}
+	// Should be sorted
+	if notes[0] != 60 || notes[1] != 64 {
+		t.Errorf("expected [60, 64], got %v", notes)
+	}
+
+	// Non-mapped key should not produce a note
+	state.pressKey('`')
+	notes = state.activeNotes()
+	if len(notes) != 2 {
+		t.Errorf("expected still 2 notes after non-mapped key, got %d", len(notes))
+	}
+}
+
+func TestAccordionStateExpireKeys(t *testing.T) {
+	state := newAccordionState()
+
+	// Set a key with an old timestamp
+	state.mu.Lock()
+	state.activeKeys['q'] = time.Now().Add(-1 * time.Second) // expired
+	state.activeKeys['w'] = time.Now()                       // fresh
+	state.mu.Unlock()
+
+	state.expireKeys()
+
+	notes := state.activeNotes()
+	if len(notes) != 1 || notes[0] != 62 { // 'w' = D4 = 62
+		t.Errorf("expected only D4 (62) after expiry, got %v", notes)
+	}
+}
+
+func TestRenderTiltBar(t *testing.T) {
+	// Center tilt should have marker at center
+	bar := renderTiltBar(0)
+	if len(bar) != 16 {
+		t.Errorf("tilt bar length = %d, want 16", len(bar))
+	}
+
+	// Positive tilt should shift marker right
+	barRight := renderTiltBar(0.5)
+	barLeft := renderTiltBar(-0.5)
+	// Just verify they're different and correct length
+	if len(barRight) != 16 || len(barLeft) != 16 {
+		t.Error("tilt bar wrong length")
+	}
+	if barRight == barLeft {
+		t.Error("left and right tilt should produce different bars")
+	}
+}
+
 func TestNoOutputWhenStdioModeDisabled(t *testing.T) {
 	resetGlobals()
 	stdioMode = false

@@ -1,9 +1,7 @@
-// spank detects slaps/hits on the laptop and runs an ASCII footrace.
+// spank detects slaps/hits on the laptop and runs an ASCII footrace,
+// or transforms your MacBook into a fully operational accordion.
 // It reads the Apple Silicon accelerometer directly via IOKit HID —
 // no separate sensor daemon required. Needs sudo.
-//
-// Slap or tap your laptop to sprint! Each hit accelerates your runner.
-// Inspired by Microsoft Decathlon's alternating-key sprinting mechanic.
 package main
 
 import (
@@ -15,6 +13,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -22,6 +21,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/fang"
+	"github.com/gopxl/beep/v2"
+	"github.com/gopxl/beep/v2/speaker"
 	"github.com/spf13/cobra"
 	"github.com/taigrr/apple-silicon-accelerometer/detector"
 	"github.com/taigrr/apple-silicon-accelerometer/sensor"
@@ -32,6 +33,7 @@ var version = "dev"
 
 var (
 	fastMode      bool
+	accordionMode bool
 	minAmplitude  float64
 	cooldownMs    int
 	stdioMode     bool
@@ -60,12 +62,12 @@ const (
 	defaultRaceDistance       = 100.0
 	defaultNumOpponents       = 3
 
-	// Physics constants
-	tapImpulse     = 2.0   // m/s added per tap
-	maxPlayerSpeed = 12.0  // m/s cap (Usain Bolt peaks ~12.2 m/s)
-	friction       = 0.975 // velocity multiplier per frame at 30fps
+	// Footrace physics
+	tapImpulse     = 2.0
+	maxPlayerSpeed = 12.0
+	friction       = 0.975
 	renderFPS      = 30
-	trackWidth     = 60 // display characters for the track
+	trackWidth     = 60
 )
 
 type runtimeTuning struct {
@@ -96,33 +98,26 @@ func applyFastOverlay(base runtimeTuning) runtimeTuning {
 	return base
 }
 
-// --------------------------------------------------------------------
-// Runner & Race types
-// --------------------------------------------------------------------
+// ====================================================================
+// Runner & Footrace types
+// ====================================================================
 
 type runner struct {
 	name        string
 	lane        int
-	position    float64 // meters
-	velocity    float64 // m/s
+	position    float64
+	velocity    float64
 	animFrame   int
 	animCounter int
 	isPlayer    bool
 	finished    bool
 	finishTime  time.Duration
-	// AI fields
 	targetSpeed float64
 	accelRate   float64
 	jitter      float64
 }
 
-// Running animation frames (side-view stick figure)
-var runFrames = []string{
-	`o/`,
-	`o-`,
-	`o\`,
-	`o-`,
-}
+var runFrames = []string{`o/`, `o-`, `o\`, `o-`}
 
 const idleFrame = `o|`
 const winFrame = `\o/`
@@ -141,9 +136,6 @@ var defaultAIProfiles = []aiProfile{
 	{"DREW", 8.0, 0.45, 0.5},
 }
 
-// amplitudeToBoost maps a detected slap amplitude to a speed boost
-// multiplier. Harder hits give a bigger boost.
-// Returns a value in [0.5, 1.5].
 func amplitudeToBoost(amplitude float64) float64 {
 	const (
 		minAmp   = 0.05
@@ -162,8 +154,6 @@ func amplitudeToBoost(amplitude float64) float64 {
 	return minBoost + t*(maxBoost-minBoost)
 }
 
-// amplitudeToVolume is kept for backward compatibility with stdio commands.
-// Maps amplitude to a volume level in [-3.0, 0.0].
 func amplitudeToVolume(amplitude float64) float64 {
 	const (
 		minAmp = 0.05
@@ -182,9 +172,9 @@ func amplitudeToVolume(amplitude float64) float64 {
 	return minVol + t*(maxVol-minVol)
 }
 
-// --------------------------------------------------------------------
-// Rendering
-// --------------------------------------------------------------------
+// ====================================================================
+// Terminal helpers
+// ====================================================================
 
 func clearScreen() {
 	fmt.Print("\033[2J\033[H")
@@ -198,27 +188,27 @@ func showCursor() {
 	fmt.Print("\033[?25h")
 }
 
-func renderRace(runners []*runner, elapsed time.Duration, distance float64, phase string) {
-	fmt.Print("\033[H") // cursor home (no clear to reduce flicker)
+// ====================================================================
+// Footrace rendering
+// ====================================================================
 
+func renderRace(runners []*runner, elapsed time.Duration, distance float64, phase string) {
+	fmt.Print("\033[H")
 	var buf strings.Builder
 
 	seconds := elapsed.Seconds()
 	timeStr := fmt.Sprintf("%02d:%05.2f", int(seconds)/60, math.Mod(seconds, 60))
 
-	// Header
 	buf.WriteString("\n")
 	buf.WriteString(fmt.Sprintf("  %-40s Time: %s\n", "SPANK SPRINT  "+fmt.Sprintf("%.0fm DASH", distance), timeStr))
 	buf.WriteString("\n")
 
-	// Track top border with distance markers
 	border := "  " + strings.Repeat("·", trackWidth+4) + "|\n"
 	buf.WriteString(border)
 
 	finishLabel := fmt.Sprintf("%*s", trackWidth+3, "FINISH")
 	buf.WriteString("  " + finishLabel + "|\n")
 
-	// Lanes
 	for _, r := range runners {
 		col := int(r.position / distance * float64(trackWidth))
 		if col > trackWidth {
@@ -228,7 +218,6 @@ func renderRace(runners []*runner, elapsed time.Duration, distance float64, phas
 			col = 0
 		}
 
-		// Choose sprite
 		var sprite string
 		switch {
 		case r.finished:
@@ -244,14 +233,12 @@ func renderRace(runners []*runner, elapsed time.Duration, distance float64, phas
 			label = r.name + "*"
 		}
 
-		// Build lane: "  1 NAME   [sprite at position]          |"
 		lane := make([]byte, trackWidth+2)
 		for i := range lane {
 			lane[i] = ' '
 		}
 		lane[trackWidth+1] = '|'
 
-		// Place sprite
 		spriteBytes := []byte(sprite)
 		for i, b := range spriteBytes {
 			pos := col + i
@@ -263,11 +250,9 @@ func renderRace(runners []*runner, elapsed time.Duration, distance float64, phas
 		buf.WriteString(fmt.Sprintf("  %d %-5s %s\n", r.lane, label, string(lane)))
 	}
 
-	// Track bottom border
 	buf.WriteString(border)
 	buf.WriteString("\n")
 
-	// Status line
 	switch phase {
 	case "countdown":
 		buf.WriteString("                  GET READY...\n")
@@ -281,15 +266,12 @@ func renderRace(runners []*runner, elapsed time.Duration, distance float64, phas
 	}
 
 	buf.WriteString("\n")
-
 	fmt.Print(buf.String())
 }
 
 func renderCountdown(runners []*runner, distance float64, count int) {
-	elapsed := time.Duration(0)
-	renderRace(runners, elapsed, distance, "countdown")
+	renderRace(runners, 0, distance, "countdown")
 
-	// Countdown number big and centered
 	var label string
 	switch count {
 	case 3:
@@ -310,7 +292,6 @@ func renderResults(runners []*runner) {
 	fmt.Println("  ║          RACE  RESULTS           ║")
 	fmt.Println("  ╠══════════════════════════════════╣")
 
-	// Sort by finish time (unfinished last)
 	sorted := make([]*runner, len(runners))
 	copy(sorted, runners)
 	for i := 0; i < len(sorted); i++ {
@@ -348,22 +329,27 @@ func renderResults(runners []*runner) {
 	fmt.Println()
 }
 
-// --------------------------------------------------------------------
+// ====================================================================
 // CLI
-// --------------------------------------------------------------------
+// ====================================================================
 
 func main() {
 	cmd := &cobra.Command{
 		Use:   "spank",
-		Short: "ASCII sprint race powered by slapping your laptop",
-		Long: `spank reads the Apple Silicon accelerometer directly via IOKit HID
-and runs an ASCII-animated footrace. Slap or tap the laptop to sprint!
+		Short: "ASCII sprint race or accordion, powered by slapping your laptop",
+		Long: `spank reads the Apple Silicon accelerometer directly via IOKit HID.
 
-Each detected hit accelerates your runner. Harder hits give bigger boosts.
-Race against AI opponents in a 100m dash (configurable with --distance).
+DEFAULT MODE (footrace):
+  Slap or tap the laptop to sprint in an ASCII-animated 100m dash.
+  Race against AI opponents. Harder hits give bigger boosts.
 
-Requires sudo (for IOKit HID access to the accelerometer).
-Inspired by Microsoft Decathlon's alternating-key sprinting mechanic.`,
+ACCORDION MODE (--accordion):
+  Transforms your MacBook into a fully operational accordion.
+  The hinge acts as bellows — tilt to pump air.
+  The keyboard plays notes — piano-style layout.
+  The accelerometer provides expression and vibrato.
+
+Requires sudo (for IOKit HID access to the accelerometer).`,
 		Version: version,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			tuning := defaultTuning()
@@ -381,6 +367,7 @@ Inspired by Microsoft Decathlon's alternating-key sprinting mechanic.`,
 		SilenceUsage: true,
 	}
 
+	cmd.Flags().BoolVar(&accordionMode, "accordion", false, "Accordion mode: MacBook becomes a playable accordion")
 	cmd.Flags().BoolVar(&fastMode, "fast", false, "Faster polling, shorter cooldown, higher sensitivity")
 	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0)")
 	cmd.Flags().IntVar(&cooldownMs, "cooldown", defaultCooldownMs, "Cooldown between tap detections in ms")
@@ -406,17 +393,19 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	if tuning.cooldown <= 0 {
 		return fmt.Errorf("--cooldown must be greater than 0")
 	}
-	if raceDistance <= 0 {
-		return fmt.Errorf("--distance must be greater than 0")
-	}
-	if numOpponents < 1 || numOpponents > 4 {
-		return fmt.Errorf("--opponents must be between 1 and 4")
+
+	if !accordionMode {
+		if raceDistance <= 0 {
+			return fmt.Errorf("--distance must be greater than 0")
+		}
+		if numOpponents < 1 || numOpponents > 4 {
+			return fmt.Errorf("--opponents must be between 1 and 4")
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Create shared memory for accelerometer data.
 	accelRing, err := shm.CreateRing(shm.NameAccel)
 	if err != nil {
 		return fmt.Errorf("creating accel shm: %w", err)
@@ -444,20 +433,21 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 
 	time.Sleep(sensorStartupDelay)
 
+	if accordionMode {
+		return runAccordion(ctx, accelRing, tuning)
+	}
 	return runRace(ctx, accelRing, tuning)
 }
 
-// --------------------------------------------------------------------
-// Race game loop
-// --------------------------------------------------------------------
+// ====================================================================
+// Footrace game loop
+// ====================================================================
 
-// tapEvent signals that a slap was detected with given amplitude.
 type tapEvent struct {
 	amplitude float64
 }
 
 func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTuning) error {
-	// Build runners
 	runners := make([]*runner, 0, numOpponents+1)
 	runners = append(runners, &runner{
 		name:     "YOU",
@@ -475,7 +465,6 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 		})
 	}
 
-	// Start stdin command reader if in JSON mode
 	if stdioMode {
 		go readStdinCommands()
 	}
@@ -484,7 +473,6 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 	defer showCursor()
 	clearScreen()
 
-	// Countdown
 	for count := 3; count >= 0; count-- {
 		select {
 		case <-ctx.Done():
@@ -501,7 +489,6 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 		}
 	}
 
-	// Start tap detection in a goroutine that sends events
 	tapCh := make(chan tapEvent, 32)
 	go detectTaps(ctx, accelRing, tuning, tapCh)
 
@@ -521,7 +508,6 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 		case <-frameTicker.C:
 		}
 
-		// Check if paused
 		pausedMu.RLock()
 		isPaused := paused
 		pausedMu.RUnlock()
@@ -530,7 +516,6 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 			continue
 		}
 
-		// Drain tap events and apply boosts to player
 		player := runners[0]
 	drainTaps:
 		for {
@@ -554,7 +539,6 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 		elapsed := time.Since(startTime)
 		dt := 1.0 / float64(renderFPS)
 
-		// Update all runners
 		allFinished := true
 		for _, r := range runners {
 			if r.finished {
@@ -563,7 +547,6 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 			allFinished = false
 
 			if !r.isPlayer {
-				// AI: gradually accelerate toward target speed with jitter
 				diff := r.targetSpeed - r.velocity
 				r.velocity += diff * r.accelRate * dt
 				r.velocity += (rand.Float64()*2 - 1) * r.jitter * dt
@@ -574,7 +557,6 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 					r.velocity = r.targetSpeed * 1.05
 				}
 			} else {
-				// Player: apply friction decay
 				r.velocity *= math.Pow(friction, float64(renderFPS)*dt)
 				if r.velocity < 0.01 {
 					r.velocity = 0
@@ -583,17 +565,16 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 
 			r.position += r.velocity * dt
 
-			// Check finish
 			if r.position >= raceDistance {
 				r.position = raceDistance
 				r.finished = true
 				r.finishTime = elapsed
 				if r.isPlayer && stdioMode {
 					event := map[string]interface{}{
-						"event":      "finish",
-						"runner":     r.name,
-						"time":       elapsed.Seconds(),
-						"is_player":  true,
+						"event":     "finish",
+						"runner":    r.name,
+						"time":      elapsed.Seconds(),
+						"is_player": true,
 					}
 					if data, err := json.Marshal(event); err == nil {
 						fmt.Println(string(data))
@@ -601,7 +582,6 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 				}
 			}
 
-			// Animate running sprite
 			if r.velocity > 0.3 {
 				r.animCounter++
 				framesPerStep := max(1, int(8.0/(r.velocity+0.1)))
@@ -642,9 +622,7 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 			}
 		}
 
-		// After race finished, just keep displaying until Ctrl+C
 		if raceFinished {
-			// Idle loop waiting for exit
 			select {
 			case <-ctx.Done():
 				showCursor()
@@ -657,7 +635,6 @@ func runRace(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTunin
 	}
 }
 
-// detectTaps polls the accelerometer and sends tap events on the channel.
 func detectTaps(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTuning, tapCh chan<- tapEvent) {
 	det := detector.New()
 	var lastAccelTotal uint64
@@ -722,9 +699,543 @@ func detectTaps(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTu
 	}
 }
 
-// --------------------------------------------------------------------
+// ====================================================================
+// Accordion mode
+// ====================================================================
+
+const (
+	accordionSampleRate = 44100
+	accordionFPS        = 30
+
+	// Bellows physics
+	bellowsDecay    = 0.92 // how fast bellows pressure fades per frame
+	bellowsGain     = 3.0  // amplifier for detected motion
+	maxBellows      = 1.0  // maximum bellows pressure
+	vibratoRate     = 5.5  // Hz
+	vibratoDepth    = 0.02 // frequency modulation depth
+
+	// Key repeat timeout — if a key hasn't been re-pressed within this
+	// duration, consider it released (terminal key repeat is ~30-60ms).
+	keyHoldTimeout = 180 * time.Millisecond
+)
+
+// noteFreq returns the frequency in Hz for a given MIDI note number.
+// Middle C (C4) = MIDI 60 = 261.63 Hz.
+func noteFreq(midi int) float64 {
+	return 440.0 * math.Pow(2.0, float64(midi-69)/12.0)
+}
+
+// noteName returns a human-readable name for a MIDI note.
+func noteName(midi int) string {
+	names := []string{"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"}
+	octave := (midi / 12) - 1
+	note := midi % 12
+	return fmt.Sprintf("%s%d", names[note], octave)
+}
+
+// keyToMIDI maps keyboard characters to MIDI note numbers.
+// Layout mimics a piano keyboard across two rows:
+//
+//	Black keys:  2  3     5  6  7     9  0
+//	             C# D#    F# G# A#   C# D#
+//	White keys: Q  W  E  R  T  Y  U  I  O  P
+//	            C4 D4 E4 F4 G4 A4 B4 C5 D5 E5
+//
+//	Black keys:  s  d     g  h  j     l  ;
+//	             C# D#    F# G# A#   C# D#
+//	White keys: Z  X  C  V  B  N  M  ,  .  /
+//	            C3 D3 E3 F3 G3 A3 B3 C4 D4 E4
+var keyToMIDI = map[byte]int{
+	// Upper octave — white keys (C4-E5)
+	'q': 60, 'w': 62, 'e': 64, 'r': 65, 't': 67, 'y': 69, 'u': 71,
+	'i': 72, 'o': 74, 'p': 76,
+	// Upper octave — black keys
+	'2': 61, '3': 63, '5': 66, '6': 68, '7': 70,
+	'9': 73, '0': 75,
+	// Lower octave — white keys (C3-E4)
+	'z': 48, 'x': 50, 'c': 52, 'v': 53, 'b': 55, 'n': 57, 'm': 59,
+	',': 60, '.': 62, '/': 64,
+	// Lower octave — black keys
+	's': 49, 'd': 51, 'g': 54, 'h': 56, 'j': 58,
+	'l': 61, ';': 63,
+}
+
+// accordionState holds the live state of the accordion instrument.
+type accordionState struct {
+	mu            sync.RWMutex
+	activeKeys    map[byte]time.Time // key -> last press time
+	bellows       float64            // 0.0 (silent) to 1.0 (full volume)
+	tiltX         float64            // lateral tilt for vibrato
+	tiltY         float64            // forward/back tilt — main bellows driver
+	prevTiltY     float64            // previous frame tilt for delta
+	speakerInited bool
+}
+
+func newAccordionState() *accordionState {
+	return &accordionState{
+		activeKeys: make(map[byte]time.Time),
+	}
+}
+
+// activeNotes returns the MIDI notes currently being held, sorted.
+func (a *accordionState) activeNotes() []int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	now := time.Now()
+	notes := make([]int, 0, len(a.activeKeys))
+	for key, t := range a.activeKeys {
+		if now.Sub(t) <= keyHoldTimeout {
+			if midi, ok := keyToMIDI[key]; ok {
+				notes = append(notes, midi)
+			}
+		}
+	}
+	// Sort for deterministic display
+	for i := 0; i < len(notes); i++ {
+		for j := i + 1; j < len(notes); j++ {
+			if notes[j] < notes[i] {
+				notes[i], notes[j] = notes[j], notes[i]
+			}
+		}
+	}
+	return notes
+}
+
+// expireKeys removes keys that haven't been re-pressed recently.
+func (a *accordionState) expireKeys() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now()
+	for key, t := range a.activeKeys {
+		if now.Sub(t) > keyHoldTimeout {
+			delete(a.activeKeys, key)
+		}
+	}
+}
+
+// pressKey registers a keypress.
+func (a *accordionState) pressKey(key byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.activeKeys[key] = time.Now()
+}
+
+// toneGenerator streams a sine wave for the accordion, mixing all active
+// notes and modulating by bellows pressure and vibrato.
+type toneGenerator struct {
+	state      *accordionState
+	sampleRate float64
+	pos        uint64
+}
+
+func (t *toneGenerator) Stream(samples [][2]float64) (int, bool) {
+	t.state.mu.RLock()
+	bellows := t.state.bellows
+	tiltX := t.state.tiltX
+	t.state.mu.RUnlock()
+
+	activeNotes := t.state.activeNotes()
+
+	for i := range samples {
+		if len(activeNotes) == 0 || bellows < 0.01 {
+			samples[i] = [2]float64{0, 0}
+			t.pos++
+			continue
+		}
+
+		tSec := float64(t.pos) / t.sampleRate
+
+		// Vibrato from lateral tilt
+		vibrato := 1.0 + tiltX*vibratoDepth*math.Sin(2*math.Pi*vibratoRate*tSec)
+
+		// Mix all active notes
+		val := 0.0
+		for _, midi := range activeNotes {
+			freq := noteFreq(midi) * vibrato
+			phase := 2 * math.Pi * freq * tSec
+
+			// Accordion timbre: fundamental + odd harmonics (reed-like)
+			v := math.Sin(phase)                    // fundamental
+			v += 0.5 * math.Sin(3*phase)            // 3rd harmonic
+			v += 0.25 * math.Sin(5*phase)           // 5th harmonic
+			v += 0.12 * math.Sin(7*phase)           // 7th harmonic
+			v += 0.06 * math.Sin(9*phase)           // 9th harmonic
+			val += v * 0.4 // scale per-note volume
+		}
+
+		// Normalize if many notes
+		if len(activeNotes) > 1 {
+			val /= math.Sqrt(float64(len(activeNotes)))
+		}
+
+		// Apply bellows volume envelope
+		val *= bellows
+
+		// Soft clamp
+		if val > 0.95 {
+			val = 0.95
+		}
+		if val < -0.95 {
+			val = -0.95
+		}
+
+		samples[i] = [2]float64{val, val}
+		t.pos++
+	}
+	return len(samples), true
+}
+
+func (t *toneGenerator) Err() error { return nil }
+
+// enableRawTerminal puts the terminal in raw mode for single-keypress input.
+func enableRawTerminal() error {
+	// Use stty on macOS — the only target platform
+	cmd := exec.Command("stty", "raw", "-echo")
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
+}
+
+// restoreTerminal restores normal terminal mode.
+func restoreTerminal() {
+	cmd := exec.Command("stty", "sane")
+	cmd.Stdin = os.Stdin
+	_ = cmd.Run()
+}
+
+// readKeys reads raw keypresses from stdin and sends them on keyCh.
+func readKeys(ctx context.Context, keyCh chan<- byte) {
+	buf := make([]byte, 1)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		n, err := os.Stdin.Read(buf)
+		if err != nil || n == 0 {
+			continue
+		}
+		// Ctrl+C detection (raw mode doesn't generate SIGINT)
+		if buf[0] == 3 {
+			// Send ourselves SIGINT to trigger clean shutdown
+			syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+			return
+		}
+		select {
+		case keyCh <- buf[0]:
+		default:
+		}
+	}
+}
+
+// readBellows polls the accelerometer and updates bellows state.
+func readBellows(ctx context.Context, accelRing *shm.RingBuffer, state *accordionState) {
+	var lastAccelTotal uint64
+
+	ticker := time.NewTicker(defaultSensorPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		samples, newTotal := accelRing.ReadNew(lastAccelTotal, shm.AccelScale)
+		lastAccelTotal = newTotal
+
+		if len(samples) == 0 {
+			continue
+		}
+
+		// Use the latest sample's gravity vector to estimate tilt.
+		// On a MacBook sitting flat: X≈0, Y≈0, Z≈-1g
+		// Tilting forward/back changes Y; tilting sideways changes X.
+		latest := samples[len(samples)-1]
+
+		state.mu.Lock()
+		state.tiltX = latest.X
+		newTiltY := latest.Y
+
+		// Bellows pressure = rate of change of tilt (pumping motion).
+		// Opening/closing the lid or rocking the laptop drives this.
+		delta := math.Abs(newTiltY - state.prevTiltY)
+		state.prevTiltY = newTiltY
+		state.tiltY = newTiltY
+
+		// Also factor in overall motion magnitude (shaking/squeezing)
+		accelMag := math.Sqrt(latest.X*latest.X+latest.Y*latest.Y+latest.Z*latest.Z) - 1.0
+		if accelMag < 0 {
+			accelMag = 0
+		}
+
+		// Drive bellows from tilt delta + general motion
+		state.bellows += (delta + accelMag*0.5) * bellowsGain
+		if state.bellows > maxBellows {
+			state.bellows = maxBellows
+		}
+
+		// Decay
+		state.bellows *= bellowsDecay
+		if state.bellows < 0.01 {
+			state.bellows = 0
+		}
+		state.mu.Unlock()
+	}
+}
+
+// renderAccordion draws the ASCII accordion interface.
+func renderAccordion(state *accordionState) {
+	fmt.Print("\033[H") // cursor home
+
+	state.mu.RLock()
+	bellows := state.bellows
+	tiltY := state.tiltY
+	state.mu.RUnlock()
+
+	activeNotes := state.activeNotes()
+
+	var buf strings.Builder
+
+	// Header
+	buf.WriteString("\n")
+	buf.WriteString("  ╔══════════════════════════════════════════════════════════════╗\n")
+	buf.WriteString("  ║           SPANK ACCORDION  —  MacBook Squeezebox            ║\n")
+	buf.WriteString("  ╠══════════════════════════════════════════════════════════════╣\n")
+
+	// Bellows width varies with tilt and pressure
+	bellowsWidth := 3 + int(math.Abs(tiltY)*8)
+	if bellowsWidth > 16 {
+		bellowsWidth = 16
+	}
+	if bellowsWidth < 3 {
+		bellowsWidth = 3
+	}
+
+	// Generate bellows fill pattern
+	bellowsFill := func(w int) string {
+		if w <= 0 {
+			return ""
+		}
+		pattern := make([]byte, w)
+		for i := range pattern {
+			if i%2 == 0 {
+				pattern[i] = '>'
+			} else {
+				pattern[i] = '<'
+			}
+		}
+		return string(pattern)
+	}
+
+	// Left side: bass buttons  |  bellows  |  Right side: treble buttons
+	leftWidth := 12
+	rightWidth := 12
+
+	// Draw the accordion body
+	padBellows := func(w int) string {
+		fill := bellowsFill(w)
+		return fmt.Sprintf("%-16s", fill)
+	}
+
+	// Determine active key display for left (lower octave) and right (upper octave)
+	leftActive := make(map[byte]bool)
+	rightActive := make(map[byte]bool)
+
+	state.mu.RLock()
+	now := time.Now()
+	for key, t := range state.activeKeys {
+		if now.Sub(t) <= keyHoldTimeout {
+			switch key {
+			case 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',
+				's', 'd', 'g', 'h', 'j', 'l', ';':
+				leftActive[key] = true
+			default:
+				rightActive[key] = true
+			}
+		}
+	}
+	state.mu.RUnlock()
+
+	// Bass side buttons (lower octave)
+	bassRow1 := highlightKeys("Z X C V B N M , . /", leftActive)
+	bassRow2 := highlightKeys("  s d   g h j   l ;", leftActive)
+
+	// Treble side buttons (upper octave)
+	trebRow1 := highlightKeys("Q W E R T Y U I O P", rightActive)
+	trebRow2 := highlightKeys("  2 3   5 6 7   9 0", rightActive)
+
+	bf := padBellows(bellowsWidth)
+
+	buf.WriteString(fmt.Sprintf("  ║  ┌──────────┐ %s ┌──────────┐  ║\n", bf))
+	buf.WriteString(fmt.Sprintf("  ║  │%-*s│ %s │%-*s│  ║\n", leftWidth, trebRow2, bf, rightWidth, bassRow2))
+	buf.WriteString(fmt.Sprintf("  ║  │%-*s│ %s │%-*s│  ║\n", leftWidth, trebRow1, bf, rightWidth, bassRow1))
+
+	// Bellows pressure bar
+	pressBar := int(bellows * 16)
+	if pressBar > 16 {
+		pressBar = 16
+	}
+	bellowsBar := strings.Repeat("█", pressBar) + strings.Repeat("░", 16-pressBar)
+	buf.WriteString(fmt.Sprintf("  ║  │  TREBLE   │ %s │   BASS    │  ║\n", bf))
+	buf.WriteString(fmt.Sprintf("  ║  └──────────┘ %s └──────────┘  ║\n", bf))
+
+	buf.WriteString("  ╠══════════════════════════════════════════════════════════════╣\n")
+
+	// Playing notes display
+	noteStr := "(silence)"
+	if len(activeNotes) > 0 {
+		names := make([]string, len(activeNotes))
+		for i, n := range activeNotes {
+			names[i] = noteName(n)
+		}
+		noteStr = strings.Join(names, " ")
+	}
+	buf.WriteString(fmt.Sprintf("  ║  Notes: %-52s║\n", noteStr))
+
+	// Bellows meter
+	buf.WriteString(fmt.Sprintf("  ║  Bellows: [%s] %3.0f%%                            ║\n",
+		bellowsBar, bellows*100))
+
+	// Tilt indicators
+	tiltBar := renderTiltBar(tiltY)
+	buf.WriteString(fmt.Sprintf("  ║  Tilt:   [%s]                                     ║\n", tiltBar))
+
+	buf.WriteString("  ╠══════════════════════════════════════════════════════════════╣\n")
+
+	// Keyboard map reference
+	buf.WriteString("  ║  KEYBOARD MAP (piano-style):                                ║\n")
+	buf.WriteString("  ║                                                              ║\n")
+	buf.WriteString("  ║  Treble:  ┌─┬─┬─┬─┬─┬─┬─┬─┬─┬─┐                            ║\n")
+	buf.WriteString("  ║  Black:   │2│3│ │5│6│7│ │9│0│ │   C#D#  F#G#A#  C#D#        ║\n")
+	buf.WriteString("  ║  White:   │Q│W│E│R│T│Y│U│I│O│P│   C D E F G A B C D E       ║\n")
+	buf.WriteString("  ║          └─┴─┴─┴─┴─┴─┴─┴─┴─┴─┘   (octave 4-5)             ║\n")
+	buf.WriteString("  ║                                                              ║\n")
+	buf.WriteString("  ║  Bass:    ┌─┬─┬─┬─┬─┬─┬─┬─┬─┬─┐                            ║\n")
+	buf.WriteString("  ║  Black:   │s│d│ │g│h│j│ │l│;│ │   C#D#  F#G#A#  C#D#        ║\n")
+	buf.WriteString("  ║  White:   │Z│X│C│V│B│N│M│,│.│/│   C D E F G A B C D E       ║\n")
+	buf.WriteString("  ║          └─┴─┴─┴─┴─┴─┴─┴─┴─┴─┘   (octave 3-4)             ║\n")
+	buf.WriteString("  ║                                                              ║\n")
+	buf.WriteString("  ║  TILT laptop to pump bellows  •  Ctrl+C to quit              ║\n")
+	buf.WriteString("  ╚══════════════════════════════════════════════════════════════╝\n")
+
+	fmt.Print(buf.String())
+}
+
+// highlightKeys returns the key display string with active keys uppercased/marked.
+func highlightKeys(layout string, active map[byte]bool) string {
+	result := make([]byte, len(layout))
+	for i := 0; i < len(layout); i++ {
+		ch := layout[i]
+		lower := ch
+		if ch >= 'A' && ch <= 'Z' {
+			lower = ch + 32
+		}
+		if active[lower] || active[ch] {
+			if ch >= 'a' && ch <= 'z' {
+				result[i] = ch - 32 // uppercase to highlight
+			} else if ch == ' ' {
+				result[i] = ' '
+			} else {
+				result[i] = ch
+			}
+		} else {
+			if ch >= 'A' && ch <= 'Z' {
+				result[i] = ch + 32 // show as lowercase when not active
+			} else {
+				result[i] = ch
+			}
+		}
+	}
+	return string(result)
+}
+
+// renderTiltBar shows a centered tilt indicator.
+func renderTiltBar(tilt float64) string {
+	const width = 16
+	center := width / 2
+	bar := make([]byte, width)
+	for i := range bar {
+		bar[i] = '-'
+	}
+	bar[center] = '|'
+
+	pos := center + int(tilt*float64(center))
+	if pos < 0 {
+		pos = 0
+	}
+	if pos >= width {
+		pos = width - 1
+	}
+	bar[pos] = '#'
+
+	return string(bar)
+}
+
+func runAccordion(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTuning) error {
+	state := newAccordionState()
+
+	// Initialize speaker for tone generation
+	sr := beep.SampleRate(accordionSampleRate)
+	speaker.Init(sr, sr.N(time.Second/30))
+
+	gen := &toneGenerator{
+		state:      state,
+		sampleRate: float64(accordionSampleRate),
+	}
+
+	// Start continuous tone playback (it's silent when no keys are pressed
+	// or bellows are empty)
+	speaker.Play(gen)
+
+	// Put terminal in raw mode for keypress capture
+	if err := enableRawTerminal(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not enable raw mode: %v\n", err)
+	}
+	defer restoreTerminal()
+
+	hideCursor()
+	defer showCursor()
+	clearScreen()
+
+	// Start keyboard reader
+	keyCh := make(chan byte, 64)
+	go readKeys(ctx, keyCh)
+
+	// Start bellows reader (accelerometer -> bellows pressure)
+	go readBellows(ctx, accelRing, state)
+
+	// Start stdin command reader if in JSON mode
+	if stdioMode {
+		go readStdinCommands()
+	}
+
+	frameTicker := time.NewTicker(time.Second / accordionFPS)
+	defer frameTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			speaker.Clear()
+			restoreTerminal()
+			showCursor()
+			clearScreen()
+			fmt.Println("bye!")
+			return nil
+		case key := <-keyCh:
+			state.pressKey(key)
+		case <-frameTicker.C:
+			state.expireKeys()
+			renderAccordion(state)
+		}
+	}
+}
+
+// ====================================================================
 // Stdin command interface (kept for stdio/GUI integration)
-// --------------------------------------------------------------------
+// ====================================================================
 
 type stdinCommand struct {
 	Cmd       string  `json:"cmd"`
