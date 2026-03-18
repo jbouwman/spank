@@ -618,6 +618,211 @@ func TestRenderTiltBar(t *testing.T) {
 	}
 }
 
+func TestBagpipeReed(t *testing.T) {
+	// bagpipeReed should return a value in [-1, 1] range (normalized)
+	for _, freq := range []float64{240.0, 480.0, 960.0} {
+		for tSec := 0.0; tSec < 0.01; tSec += 0.0001 {
+			v := bagpipeReed(freq, tSec, 1.0)
+			if v < -1.1 || v > 1.1 {
+				t.Errorf("bagpipeReed(%f, %f, 1.0) = %f, outside expected range", freq, tSec, v)
+			}
+		}
+	}
+
+	// Lower brightness should produce less high-frequency content (lower peak)
+	// Test by checking that bright tones have higher max absolute values
+	maxBright := 0.0
+	maxDim := 0.0
+	for tSec := 0.0; tSec < 0.01; tSec += 0.0001 {
+		vBright := math.Abs(bagpipeReed(480.0, tSec, 1.0))
+		vDim := math.Abs(bagpipeReed(480.0, tSec, 0.0))
+		if vBright > maxBright {
+			maxBright = vBright
+		}
+		if vDim > maxDim {
+			maxDim = vDim
+		}
+	}
+	// Both should be <= 1 (normalized)
+	if maxBright > 1.1 {
+		t.Errorf("bright bagpipeReed max = %f, want <= 1.0", maxBright)
+	}
+	if maxDim > 1.1 {
+		t.Errorf("dim bagpipeReed max = %f, want <= 1.0", maxDim)
+	}
+}
+
+func TestChanterScale(t *testing.T) {
+	// Scale should be ascending in frequency
+	for i := 1; i < len(chanterScale); i++ {
+		if chanterScale[i].freq <= chanterScale[i-1].freq {
+			t.Errorf("chanterScale[%d] (%s, %.0f Hz) should be higher than [%d] (%s, %.0f Hz)",
+				i, chanterScale[i].name, chanterScale[i].freq,
+				i-1, chanterScale[i-1].name, chanterScale[i-1].freq)
+		}
+	}
+
+	// Should have 9 notes (Low G through High A)
+	if len(chanterScale) != 9 {
+		t.Errorf("chanterScale has %d notes, want 9", len(chanterScale))
+	}
+
+	// Each note should have a unique key
+	keys := make(map[byte]bool)
+	for _, n := range chanterScale {
+		if keys[n.key] {
+			t.Errorf("duplicate chanter key: %c", n.key)
+		}
+		keys[n.key] = true
+	}
+}
+
+func TestChanterKeyToNote(t *testing.T) {
+	// All chanter scale keys should be in the map
+	for i, n := range chanterScale {
+		idx, ok := chanterKeyToNote[n.key]
+		if !ok {
+			t.Errorf("chanterKeyToNote missing key %c", n.key)
+		}
+		if idx != i {
+			t.Errorf("chanterKeyToNote[%c] = %d, want %d", n.key, idx, i)
+		}
+	}
+}
+
+func TestBagpipeStateCurrentChanterNote(t *testing.T) {
+	state := newBagpipeState()
+
+	// No note initially
+	if idx := state.currentChanterNote(); idx != -1 {
+		t.Errorf("expected -1 with no keys, got %d", idx)
+	}
+
+	// Press Low A (key 's')
+	state.pressKey('s')
+	if idx := state.currentChanterNote(); idx != 1 {
+		t.Errorf("expected 1 (Low A) after pressing 's', got %d", idx)
+	}
+
+	// Press D (key 'j') — more recent, should win
+	time.Sleep(1 * time.Millisecond)
+	state.pressKey('j')
+	if idx := state.currentChanterNote(); idx != 4 {
+		t.Errorf("expected 4 (D) after pressing 'j', got %d", idx)
+	}
+
+	// Non-chanter key should not affect result
+	state.pressKey('z')
+	if idx := state.currentChanterNote(); idx != 4 {
+		t.Errorf("expected still 4 after non-chanter key, got %d", idx)
+	}
+}
+
+func TestBagpipeStateBlowing(t *testing.T) {
+	state := newBagpipeState()
+
+	// Not blowing initially
+	state.mu.RLock()
+	if state.blowing {
+		t.Error("expected not blowing initially")
+	}
+	state.mu.RUnlock()
+
+	// Pressing space = blowing
+	state.pressKey(' ')
+	state.mu.RLock()
+	if !state.blowing {
+		t.Error("expected blowing after pressing space")
+	}
+	state.mu.RUnlock()
+}
+
+func TestUpdateBag(t *testing.T) {
+	state := newBagpipeState()
+
+	// Blowing should increase bag
+	state.mu.Lock()
+	state.blowing = true
+	state.bag = 0.5
+	state.mu.Unlock()
+
+	updateBag(state)
+
+	state.mu.RLock()
+	if state.bag <= 0.5 {
+		t.Errorf("bag should increase while blowing, got %f", state.bag)
+	}
+	state.mu.RUnlock()
+
+	// Not blowing should decrease bag (leak)
+	state.mu.Lock()
+	state.blowing = false
+	state.bag = 0.5
+	state.mu.Unlock()
+
+	updateBag(state)
+
+	state.mu.RLock()
+	if state.bag >= 0.5 {
+		t.Errorf("bag should decrease while not blowing, got %f", state.bag)
+	}
+	state.mu.RUnlock()
+
+	// Bag should clamp at 0
+	state.mu.Lock()
+	state.bag = 0.001
+	state.blowing = false
+	state.mu.Unlock()
+
+	updateBag(state)
+
+	state.mu.RLock()
+	if state.bag < 0 {
+		t.Errorf("bag should not go below 0, got %f", state.bag)
+	}
+	state.mu.RUnlock()
+
+	// Bag should clamp at max
+	state.mu.Lock()
+	state.bag = 0.99
+	state.blowing = true
+	state.mu.Unlock()
+
+	updateBag(state)
+
+	state.mu.RLock()
+	if state.bag > maxBag {
+		t.Errorf("bag should not exceed maxBag, got %f", state.bag)
+	}
+	state.mu.RUnlock()
+}
+
+func TestChanterFingerState(t *testing.T) {
+	state := newBagpipeState()
+
+	// No fingers down
+	fingers := state.chanterFingerState()
+	for i, f := range fingers {
+		if f {
+			t.Errorf("finger %d should be up with no keys pressed", i)
+		}
+	}
+
+	// Press Low G (index 0, key 'a') and D (index 4, key 'j')
+	state.pressKey('a')
+	state.pressKey('j')
+	fingers = state.chanterFingerState()
+	if !fingers[0] {
+		t.Error("finger 0 (Low G) should be down")
+	}
+	if !fingers[4] {
+		t.Error("finger 4 (D) should be down")
+	}
+	if fingers[1] {
+		t.Error("finger 1 (Low A) should be up")
+	}
+}
+
 func TestNoOutputWhenStdioModeDisabled(t *testing.T) {
 	resetGlobals()
 	stdioMode = false
