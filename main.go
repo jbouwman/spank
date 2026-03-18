@@ -1,5 +1,6 @@
 // spank detects slaps/hits on the laptop and runs an ASCII footrace,
-// or transforms your MacBook into a fully operational accordion.
+// transforms your MacBook into a fully operational accordion, or turns
+// it into a set of Highland bagpipes.
 // It reads the Apple Silicon accelerometer directly via IOKit HID —
 // no separate sensor daemon required. Needs sudo.
 package main
@@ -34,6 +35,7 @@ var version = "dev"
 var (
 	fastMode      bool
 	accordionMode bool
+	bagpipeMode   bool
 	minAmplitude  float64
 	cooldownMs    int
 	stdioMode     bool
@@ -336,7 +338,7 @@ func renderResults(runners []*runner) {
 func main() {
 	cmd := &cobra.Command{
 		Use:   "spank",
-		Short: "ASCII sprint race or accordion, powered by slapping your laptop",
+		Short: "ASCII sprint race, accordion, or bagpipes — powered by slapping your laptop",
 		Long: `spank reads the Apple Silicon accelerometer directly via IOKit HID.
 
 DEFAULT MODE (footrace):
@@ -348,6 +350,13 @@ ACCORDION MODE (--accordion):
   The hinge acts as bellows — tilt to pump air.
   The keyboard plays notes — piano-style layout.
   The accelerometer provides expression and vibrato.
+
+BAGPIPE MODE (--bagpipe):
+  Transforms your MacBook into a set of Highland bagpipes.
+  Hold SPACEBAR to blow into the blowpipe and fill the bag.
+  Tilt/squeeze the laptop to compress the bag (hinge = bag pressure).
+  ASDF JKL;' keys play the chanter (9-note GHB scale).
+  Three drones sound continuously when the bag has air.
 
 Requires sudo (for IOKit HID access to the accelerometer).`,
 		Version: version,
@@ -368,6 +377,7 @@ Requires sudo (for IOKit HID access to the accelerometer).`,
 	}
 
 	cmd.Flags().BoolVar(&accordionMode, "accordion", false, "Accordion mode: MacBook becomes a playable accordion")
+	cmd.Flags().BoolVar(&bagpipeMode, "bagpipe", false, "Bagpipe mode: MacBook becomes Highland bagpipes")
 	cmd.Flags().BoolVar(&fastMode, "fast", false, "Faster polling, shorter cooldown, higher sensitivity")
 	cmd.Flags().Float64Var(&minAmplitude, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0)")
 	cmd.Flags().IntVar(&cooldownMs, "cooldown", defaultCooldownMs, "Cooldown between tap detections in ms")
@@ -394,7 +404,11 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		return fmt.Errorf("--cooldown must be greater than 0")
 	}
 
-	if !accordionMode {
+	if accordionMode && bagpipeMode {
+		return fmt.Errorf("--accordion and --bagpipe are mutually exclusive; pick one")
+	}
+
+	if !accordionMode && !bagpipeMode {
 		if raceDistance <= 0 {
 			return fmt.Errorf("--distance must be greater than 0")
 		}
@@ -435,6 +449,9 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 
 	if accordionMode {
 		return runAccordion(ctx, accelRing, tuning)
+	}
+	if bagpipeMode {
+		return runBagpipe(ctx, accelRing, tuning)
 	}
 	return runRace(ctx, accelRing, tuning)
 }
@@ -1229,6 +1246,483 @@ func runAccordion(ctx context.Context, accelRing *shm.RingBuffer, tuning runtime
 		case <-frameTicker.C:
 			state.expireKeys()
 			renderAccordion(state)
+		}
+	}
+}
+
+// ====================================================================
+// Bagpipe mode
+// ====================================================================
+
+const (
+	bagpipeSampleRate = 44100
+	bagpipeFPS        = 30
+
+	// Bag physics
+	blowRate       = 0.035 // bag fill per frame while blowing
+	squeezeGain    = 2.5   // how much tilt contributes to bag pressure
+	bagLeakRate    = 0.008 // bag deflation per frame
+	bagSqueezeRate = 0.02  // extra pressure from squeezing (tilt)
+	maxBag         = 1.0   // max bag pressure
+	minBagForSound = 0.05  // threshold before any sound comes out
+
+	// Drone tuning — Great Highland Bagpipe
+	// Bass drone: A3 (~220 Hz, one octave below tenor)
+	// Tenor drones: A4 (~480 Hz each, slightly detuned for beating)
+	bassDroneFreq   = 240.0 // GHB Low A is ~480 Hz, bass is octave below
+	tenorDrone1Freq = 480.0
+	tenorDrone2Freq = 481.5 // 1.5 Hz detuning creates characteristic beating
+	droneVolume     = 0.15  // drones are quieter than chanter
+	chanterVolume   = 0.45  // chanter is the lead voice
+)
+
+// chanterNote defines a note on the Great Highland Bagpipe chanter.
+type chanterNote struct {
+	name string
+	freq float64
+	key  byte
+}
+
+// GHB chanter scale (9 notes). Frequencies approximate traditional GHB
+// tuning where Low A ≈ 480 Hz (sharper than concert A4).
+var chanterScale = []chanterNote{
+	{"Low G", 420.0, 'a'},
+	{"Low A", 480.0, 's'},
+	{"B", 540.0, 'd'},
+	{"C", 570.0, 'f'},
+	{"D", 640.0, 'j'},
+	{"E", 720.0, 'k'},
+	{"F", 760.0, 'l'},
+	{"High G", 855.0, ';'},
+	{"High A", 960.0, '\''},
+}
+
+// chanterKeyToNote maps chanter keys to their note index in chanterScale.
+var chanterKeyToNote = func() map[byte]int {
+	m := make(map[byte]int)
+	for i, n := range chanterScale {
+		m[n.key] = i
+	}
+	return m
+}()
+
+// bagpipeState holds the live state of the bagpipe instrument.
+type bagpipeState struct {
+	mu          sync.RWMutex
+	bag         float64          // 0.0 = empty, 1.0 = full
+	blowing     bool             // spacebar held = blowing
+	activeKeys  map[byte]time.Time
+	tiltX       float64 // lateral tilt
+	tiltY       float64 // forward/back tilt — squeeze
+	prevTiltY   float64
+	bagAnimFrame int // animation counter for the bag
+}
+
+func newBagpipeState() *bagpipeState {
+	return &bagpipeState{
+		activeKeys: make(map[byte]time.Time),
+	}
+}
+
+// currentChanterNote returns the chanter note index being played, or -1.
+// The most recently pressed chanter key wins.
+func (b *bagpipeState) currentChanterNote() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	now := time.Now()
+	bestIdx := -1
+	var bestTime time.Time
+	for key, t := range b.activeKeys {
+		if now.Sub(t) > keyHoldTimeout {
+			continue
+		}
+		if idx, ok := chanterKeyToNote[key]; ok {
+			if bestIdx == -1 || t.After(bestTime) {
+				bestIdx = idx
+				bestTime = t
+			}
+		}
+	}
+	return bestIdx
+}
+
+// chanterFingerState returns which of the 9 chanter holes are "covered"
+// (key pressed) for display purposes.
+func (b *bagpipeState) chanterFingerState() [9]bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	now := time.Now()
+	var fingers [9]bool
+	for key, t := range b.activeKeys {
+		if now.Sub(t) > keyHoldTimeout {
+			continue
+		}
+		if idx, ok := chanterKeyToNote[key]; ok {
+			fingers[idx] = true
+		}
+	}
+	return fingers
+}
+
+func (b *bagpipeState) pressKey(key byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if key == ' ' {
+		b.blowing = true
+	}
+	b.activeKeys[key] = time.Now()
+}
+
+func (b *bagpipeState) expireKeys() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	for key, t := range b.activeKeys {
+		if now.Sub(t) > keyHoldTimeout {
+			delete(b.activeKeys, key)
+			if key == ' ' {
+				b.blowing = false
+			}
+		}
+	}
+}
+
+// bagpipeGenerator synthesizes the full bagpipe sound:
+// three drones (constant) + chanter (melody) modulated by bag pressure.
+type bagpipeGenerator struct {
+	state      *bagpipeState
+	sampleRate float64
+	pos        uint64
+}
+
+func (g *bagpipeGenerator) Stream(samples [][2]float64) (int, bool) {
+	g.state.mu.RLock()
+	bag := g.state.bag
+	g.state.mu.RUnlock()
+
+	chanterIdx := g.state.currentChanterNote()
+
+	for i := range samples {
+		if bag < minBagForSound {
+			samples[i] = [2]float64{0, 0}
+			g.pos++
+			continue
+		}
+
+		tSec := float64(g.pos) / g.sampleRate
+
+		// Pressure envelope — slight warble simulates bag unsteadiness
+		pressure := bag * (1.0 + 0.015*math.Sin(2*math.Pi*3.5*tSec))
+
+		val := 0.0
+
+		// Bass drone — rich buzzy tone
+		val += droneVolume * bagpipeReed(bassDroneFreq, tSec, 0.7)
+
+		// Tenor drone 1
+		val += droneVolume * bagpipeReed(tenorDrone1Freq, tSec, 0.6)
+
+		// Tenor drone 2 (slightly detuned — beating effect)
+		val += droneVolume * bagpipeReed(tenorDrone2Freq, tSec, 0.6)
+
+		// Chanter
+		if chanterIdx >= 0 && chanterIdx < len(chanterScale) {
+			freq := chanterScale[chanterIdx].freq
+			val += chanterVolume * bagpipeReed(freq, tSec, 0.8)
+		}
+
+		// Apply bag pressure as volume envelope
+		val *= pressure
+
+		// Soft clamp
+		if val > 0.95 {
+			val = 0.95
+		}
+		if val < -0.95 {
+			val = -0.95
+		}
+
+		samples[i] = [2]float64{val, val}
+		g.pos++
+	}
+	return len(samples), true
+}
+
+func (g *bagpipeGenerator) Err() error { return nil }
+
+// bagpipeReed generates a single reed-pipe tone with the nasal, buzzy
+// timbre characteristic of bagpipe reeds. Uses a mix of harmonics
+// weighted to approximate a cane reed's spectral signature.
+// The brightness parameter (0-1) controls how many upper harmonics are present.
+func bagpipeReed(freq, t, brightness float64) float64 {
+	phase := 2 * math.Pi * freq * t
+
+	// Fundamental + strong harmonics (both even and odd for reed buzz)
+	v := math.Sin(phase)                           // H1
+	v += 0.80 * math.Sin(2*phase)                  // H2
+	v += 0.60 * math.Sin(3*phase)                  // H3
+	v += 0.45 * brightness * math.Sin(4*phase)     // H4
+	v += 0.35 * brightness * math.Sin(5*phase)     // H5
+	v += 0.25 * brightness * math.Sin(6*phase)     // H6
+	v += 0.18 * brightness * math.Sin(7*phase)     // H7
+	v += 0.12 * brightness * math.Sin(8*phase)     // H8
+	v += 0.08 * brightness * math.Sin(9*phase)     // H9
+	v += 0.05 * brightness * math.Sin(10*phase)    // H10
+
+	// Normalize
+	total := 1.0 + 0.80 + 0.60 + brightness*(0.45+0.35+0.25+0.18+0.12+0.08+0.05)
+	return v / total
+}
+
+// readBagBellows polls the accelerometer and updates bag pressure from squeezing.
+func readBagBellows(ctx context.Context, accelRing *shm.RingBuffer, state *bagpipeState) {
+	var lastAccelTotal uint64
+
+	ticker := time.NewTicker(defaultSensorPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		samples, newTotal := accelRing.ReadNew(lastAccelTotal, shm.AccelScale)
+		lastAccelTotal = newTotal
+
+		if len(samples) == 0 {
+			continue
+		}
+
+		latest := samples[len(samples)-1]
+
+		state.mu.Lock()
+		state.tiltX = latest.X
+		newTiltY := latest.Y
+
+		// Tilt delta = squeezing/rocking motion
+		delta := math.Abs(newTiltY - state.prevTiltY)
+		state.prevTiltY = newTiltY
+		state.tiltY = newTiltY
+
+		// General motion (shaking)
+		accelMag := math.Sqrt(latest.X*latest.X+latest.Y*latest.Y+latest.Z*latest.Z) - 1.0
+		if accelMag < 0 {
+			accelMag = 0
+		}
+
+		// Squeezing contributes to bag pressure (like compressing the bag)
+		state.bag += (delta + accelMag*0.3) * squeezeGain * bagSqueezeRate
+		state.mu.Unlock()
+	}
+}
+
+// updateBag is called each frame to apply blowing, leaking, and clamping.
+func updateBag(state *bagpipeState) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	// Blowing fills the bag
+	if state.blowing {
+		state.bag += blowRate
+	}
+
+	// Bag leaks
+	state.bag -= bagLeakRate
+
+	// Clamp
+	if state.bag > maxBag {
+		state.bag = maxBag
+	}
+	if state.bag < 0 {
+		state.bag = 0
+	}
+
+	state.bagAnimFrame++
+}
+
+// renderBagpipe draws the ASCII bagpipe interface.
+func renderBagpipe(state *bagpipeState) {
+	fmt.Print("\033[H")
+
+	state.mu.RLock()
+	bag := state.bag
+	blowing := state.blowing
+	tiltY := state.tiltY
+	animFrame := state.bagAnimFrame
+	state.mu.RUnlock()
+
+	chanterIdx := state.currentChanterNote()
+	fingers := state.chanterFingerState()
+
+	var buf strings.Builder
+
+	buf.WriteString("\n")
+	buf.WriteString("  ╔══════════════════════════════════════════════════════════════════╗\n")
+	buf.WriteString("  ║          SPANK BAGPIPE  —  Highland MacBook Pipes               ║\n")
+	buf.WriteString("  ╠══════════════════════════════════════════════════════════════════╣\n")
+
+	// Bag visualization — size changes with pressure
+	bagSize := int(bag * 8)
+	if bagSize > 8 {
+		bagSize = 8
+	}
+
+	// Blow indicator
+	blowStr := "    "
+	if blowing {
+		frames := []string{">>>~", ">>~>", ">~>>", "~>>>"}
+		blowStr = frames[animFrame/4%len(frames)]
+	}
+
+	// Drone indicators
+	droneStr := "      "
+	if bag >= minBagForSound {
+		droneFrames := []string{"~~~~~~", "~~~~~:", "~~~~:~", "~~~:~~"}
+		droneStr = droneFrames[animFrame/3%len(droneFrames)]
+	}
+
+	// Bag shape changes with pressure
+	bagTop := "  ┌" + strings.Repeat("─", bagSize+2) + "┐"
+	bagMid := "  │" + strings.Repeat("█", bagSize) + strings.Repeat("░", 8-bagSize) + "  │"
+	bagBot := "  └" + strings.Repeat("─", bagSize+2) + "┘"
+
+	// Pad bag sections to consistent width
+	padTo := func(s string, w int) string {
+		if len(s) >= w {
+			return s[:w]
+		}
+		return s + strings.Repeat(" ", w-len(s))
+	}
+
+	buf.WriteString(fmt.Sprintf("  ║                                                                  ║\n"))
+	buf.WriteString(fmt.Sprintf("  ║     %s %s                                            ║\n", padTo(bagTop, 14), ""))
+	buf.WriteString(fmt.Sprintf("  ║  %s─%s───── BASS DRONE %s              ║\n", blowStr, padTo(bagMid, 14), droneStr))
+	buf.WriteString(fmt.Sprintf("  ║     %s                                                   ║\n", padTo(bagMid, 14)))
+	buf.WriteString(fmt.Sprintf("  ║     %s───── TENOR DRONES %s             ║\n", padTo(bagMid, 14), droneStr))
+	buf.WriteString(fmt.Sprintf("  ║     %s                                                   ║\n", padTo(bagBot, 14)))
+
+	// Chanter with finger holes
+	holeChars := make([]byte, 9)
+	for i := 0; i < 9; i++ {
+		if fingers[i] {
+			holeChars[i] = '@' // covered
+		} else {
+			holeChars[i] = 'O' // open
+		}
+	}
+	chanterDisplay := fmt.Sprintf("%c%c%c%c %c%c%c%c%c",
+		holeChars[0], holeChars[1], holeChars[2], holeChars[3],
+		holeChars[4], holeChars[5], holeChars[6], holeChars[7], holeChars[8])
+
+	buf.WriteString(fmt.Sprintf("  ║          ┌─────────────┐                                        ║\n"))
+	buf.WriteString(fmt.Sprintf("  ║          │  CHANTER    │                                        ║\n"))
+	buf.WriteString(fmt.Sprintf("  ║          │  %s  │  <- finger holes                       ║\n", chanterDisplay))
+	buf.WriteString(fmt.Sprintf("  ║          └─────────────┘                                        ║\n"))
+	buf.WriteString(fmt.Sprintf("  ║                                                                  ║\n"))
+
+	buf.WriteString("  ╠══════════════════════════════════════════════════════════════════╣\n")
+
+	// Status
+	noteStr := "(drones only)"
+	if chanterIdx >= 0 && chanterIdx < len(chanterScale) {
+		noteStr = chanterScale[chanterIdx].name
+	}
+	if bag < minBagForSound {
+		noteStr = "(no air)"
+	}
+
+	bagBar := int(bag * 20)
+	if bagBar > 20 {
+		bagBar = 20
+	}
+	bagBarStr := strings.Repeat("█", bagBar) + strings.Repeat("░", 20-bagBar)
+
+	dronesLabel := "OFF"
+	if bag >= minBagForSound {
+		dronesLabel = "ON "
+	}
+
+	buf.WriteString(fmt.Sprintf("  ║  Note: %-14s  Bag: [%s] %3.0f%%              ║\n",
+		noteStr, bagBarStr, bag*100))
+
+	tiltBar := renderTiltBar(tiltY)
+	blowLabel := "---"
+	if blowing {
+		blowLabel = ">>>"
+	}
+	buf.WriteString(fmt.Sprintf("  ║  Drones: %s  Blow: %s  Tilt: [%s]                   ║\n",
+		dronesLabel, blowLabel, tiltBar))
+
+	buf.WriteString("  ╠══════════════════════════════════════════════════════════════════╣\n")
+
+	// Key reference
+	buf.WriteString("  ║  CHANTER (GHB scale):                                            ║\n")
+	buf.WriteString("  ║   A=Low G   S=Low A   D=B   F=C   J=D   K=E   L=F   ;=Hi G  '=Hi A  ║\n")
+	buf.WriteString("  ║                                                                  ║\n")
+	buf.WriteString("  ║  SPACEBAR = blow into blowpipe (hold to fill bag)                ║\n")
+	buf.WriteString("  ║  TILT/SQUEEZE laptop = compress the bag                          ║\n")
+	buf.WriteString("  ║  Ctrl+C = quit                                                   ║\n")
+	buf.WriteString("  ╚══════════════════════════════════════════════════════════════════╝\n")
+
+	fmt.Print(buf.String())
+}
+
+func runBagpipe(ctx context.Context, accelRing *shm.RingBuffer, tuning runtimeTuning) error {
+	state := newBagpipeState()
+
+	// Initialize speaker
+	sr := beep.SampleRate(bagpipeSampleRate)
+	speaker.Init(sr, sr.N(time.Second/30))
+
+	gen := &bagpipeGenerator{
+		state:      state,
+		sampleRate: float64(bagpipeSampleRate),
+	}
+
+	speaker.Play(gen)
+
+	if err := enableRawTerminal(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not enable raw mode: %v\n", err)
+	}
+	defer restoreTerminal()
+
+	hideCursor()
+	defer showCursor()
+	clearScreen()
+
+	// Start keyboard reader
+	keyCh := make(chan byte, 64)
+	go readKeys(ctx, keyCh)
+
+	// Start accelerometer reader for bag compression
+	go readBagBellows(ctx, accelRing, state)
+
+	if stdioMode {
+		go readStdinCommands()
+	}
+
+	frameTicker := time.NewTicker(time.Second / bagpipeFPS)
+	defer frameTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			speaker.Clear()
+			restoreTerminal()
+			showCursor()
+			clearScreen()
+			fmt.Println("bye!")
+			return nil
+		case key := <-keyCh:
+			state.pressKey(key)
+		case <-frameTicker.C:
+			state.expireKeys()
+			updateBag(state)
+			renderBagpipe(state)
 		}
 	}
 }
